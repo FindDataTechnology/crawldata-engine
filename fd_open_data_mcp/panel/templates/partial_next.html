@@ -1,0 +1,17 @@
+{% from "_macros.html" import th %}
+<table>
+  <thead>
+  <tr>{{ th(t('策略'), 'Policy') }}{{ th(t('下次触发（本地）'), 'Next fire (local)') }}{{ th(t('还有'), 'In') }}{{ th('Cron') }}</tr>
+  </thead>
+  {% for u in upcoming %}
+  <tr>
+    <td><a href="/panel/policies/{{ u.policy_id }}">{{ u.policy }}</a></td>
+    <td>{{ u.next_fire_local }}</td>
+    <td class="muted">{% if u.minutes_until < 60 %}{{ u.minutes_until }}m
+        {% else %}{{ (u.minutes_until // 60) }}h {{ u.minutes_until % 60 }}m{% endif %}</td>
+    <td class="muted">{{ u.cron_expr }} · {{ u.timezone }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="4" class="muted">{{ t('暂无启用的策略') }}</td></tr>
+  {% endfor %}
+</table>

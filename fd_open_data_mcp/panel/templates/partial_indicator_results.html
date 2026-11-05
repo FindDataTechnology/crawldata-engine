@@ -1,0 +1,61 @@
+{% from "_macros.html" import th, lbl %}
+<form method="get" action="/panel/indicators" class="chips"
+      hx-get="/panel/indicators" hx-target="#indicator-results"
+      hx-swap="innerHTML" hx-push-url="true">
+  <select name="domain" aria-label="{{ t('域') }}" hx-get="/panel/indicators" hx-include="closest form">
+    <option value="">{{ t('全部域') }}</option>
+    {% for d in filters.domains %}
+    <option value="{{ d }}" {{ 'selected' if d == domain }}>{{ d }}</option>
+    {% endfor %}
+  </select>
+  <select name="source_db" aria-label="{{ t('源库') }}" hx-get="/panel/indicators" hx-include="closest form">
+    <option value="">{{ t('全部源库') }}</option>
+    {% for d in filters.source_dbs %}
+    <option value="{{ d }}" {{ 'selected' if d == source_db }}>{{ d }}</option>
+    {% endfor %}
+  </select>
+  <select name="verified" aria-label="{{ t('验证状态') }}" hx-get="/panel/indicators" hx-include="closest form">
+    <option value="">{{ t('全部（含未验证）') }}</option>
+    <option value="1" {{ 'selected' if verified == '1' }}>{{ t('已验证') }}</option>
+    <option value="0" {{ 'selected' if verified == '0' }}>{{ t('未验证') }}</option>
+  </select>
+  <input type="search" name="q" value="{{ q }}" placeholder="{{ t('名称/代码关键词') }}"
+         aria-label="{{ t('关键词') }}" hx-get="/panel/indicators" hx-include="closest form"
+         hx-trigger="search">
+  <noscript><button type="submit" class="btn">{{ t('筛选') }}</button></noscript>
+</form>
+
+{% if page_data is none %}
+<p class="muted">{{ t('注册目录表在本库不存在（本地开发库或未跑注册 DDL）——板块只观察，不影响服务。') }}</p>
+{% else %}
+<p class="muted">{{ page_data.total }} {{ t('条 entries') }} · {{ t('第') }} {{ page_data.page }}/{{ page_data.pages }} {{ t('页 page') }}</p>
+<div class="table-wrap">
+<table>
+  <thead>
+  <tr>{{ th(t('语义代码')) }}{{ th(t('名称')) }}{{ th(t('源库')) }}{{ th(t('原生代码')) }}{{ th(t('单位')) }}{{ th(t('频率')) }}{{ th(t('域')) }}{{ th(t('状态')) }}</tr>
+  </thead>
+  {% for e in page_data.rows %}
+  <tr>
+    <td><code>{{ e.semantic_code }}</code></td>
+    <td>{{ e.name_zh or '—' }}{% if e.name_en %} <span class="en">{{ e.name_en }}</span>{% endif %}</td>
+    <td>{{ e.source_db }}</td>
+    <td><code>{{ e.source_table }}.{{ e.source_column }}#{{ e.native_code }}</code></td>
+    <td>{{ e.unit or '—' }}</td>
+    <td>{{ e.frequency or '—' }}</td>
+    <td>{{ e.domain or '—' }}</td>
+    <td>{% if e.verified %}<span class="badge success">verified</span>{% else %}<span class="badge unverified" title="{{ t('未验证 — 不入公网目录') }}">unverified</span>{% endif %}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="8" class="muted">{{ t('无匹配条目') }}</td></tr>
+  {% endfor %}
+</table>
+</div>
+{% if page_data.pages > 1 %}
+<nav class="chips" aria-label="{{ t('分页') }}">
+  {% set base = '/panel/indicators?domain=' + (domain or '') + '&source_db=' + (source_db or '') + '&verified=' + (verified or '') + '&q=' + (q or '') %}
+  {% if page_data.page > 1 %}<a class="chip" href="{{ base }}&page={{ page_data.page - 1 }}">‹ {{ t('上一页') }}</a>{% endif %}
+  <span class="chip active">{{ page_data.page }} / {{ page_data.pages }}</span>
+  {% if page_data.page < page_data.pages %}<a class="chip" href="{{ base }}&page={{ page_data.page + 1 }}">{{ t('下一页') }} ›</a>{% endif %}
+</nav>
+{% endif %}
+{% endif %}

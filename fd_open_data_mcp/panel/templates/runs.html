@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% from "_macros.html" import th %}
+{% block title %}{{ t('运行') }} · {{ t('柏讯·寻新') }}{% endblock %}
+{% block content %}
+<h2>{{ t('运行') }}</h2>
+<div id="runs-results">
+  {% include "partial_runs_results.html" %}
+</div>
+
+<h3 class="mt">{{ t('平台运行') }}</h3>
+<p class="muted">{{ t('平台运行说明') }}</p>
+<div class="table-wrap">
+<table>
+  <thead>
+  <tr>{{ th('ID') }}{{ th(t('源'), 'Source') }}{{ th(t('状态'), 'Status') }}{{ th(t('开始'), 'Started') }}{{ th(t('结束'), 'Finished') }}{{ th(t('产出行'), 'Rows') }}{{ th(t('质量'), 'Quality') }}{{ th(t('触发行'), 'Trigger') }}{{ th(t('错误'), 'Error') }}</tr>
+  </thead>
+  {% for r in platform_runs %}{% include "_platform_run_row.html" %}{% else %}
+  <tr><td colspan="9" class="muted">{{ t('暂无平台运行') }}</td></tr>
+  {% endfor %}
+</table>
+</div>
+{% endblock %}

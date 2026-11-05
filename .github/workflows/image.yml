@@ -1,0 +1,88 @@
+# Container image publish — GitHub Actions → GHCR.
+# Standard channel per openspec tcr-image-pipeline (2026-09-30 user directive).
+# Jenkins→Harbor remains the fallback channel for this repo.
+name: image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  NAMESPACE: finddatatechnology
+  IMAGE_NAME: crawldata-engine
+  DOCKERFILE: Dockerfile.torch
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # hf-mirror's relative redirects break under buildx on GitHub runners
+      # (httpx UnsupportedProtocol), so the MiniLM model is ferried as a
+      # prebuilt hub cache instead of fetched during the image build. The
+      # same hub layout serves fastembed (the snapshot includes the ONNX
+      # graph) — no torch wheel ferry since image-slimming.
+      - name: Ferry MiniLM embedding model into build context
+        env:
+          HF_HOME: ${{ github.workspace }}/hf-cache
+        run: |
+          pip install -q huggingface_hub
+          python - <<'EOF'
+          import os
+          from huggingface_hub import snapshot_download
+          # fastembed resolves this model from qdrant/all-MiniLM-L6-v2-onnx
+          # (model.onnx at repo root) — its HF source, NOT the
+          # sentence-transformers repo; the ferry must cache exactly that or
+          # the offline bake misses.
+          repo = "qdrant/all-MiniLM-L6-v2-onnx"
+          last = None
+          for endpoint in ("https://huggingface.co", "https://hf-mirror.com"):
+              os.environ["HF_ENDPOINT"] = endpoint
+              try:
+                  p = snapshot_download(repo)
+                  print("fetched via", endpoint, "->", p)
+                  break
+              except Exception as e:
+                  print("fetch via", endpoint, "failed:", e)
+                  last = e
+          else:
+              raise SystemExit(f"model ferry failed via both endpoints: {last}")
+          EOF
+          du -sh hf-cache/
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=main
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% from "_macros.html" import th %}
+{% block title %}{{ t('代理') }} · {{ t('爬虫控制台') }}{% endblock %}
+{% block content %}
+<h2>{{ t('代理与出口') }}</h2>
+
+{% if msg %}<div class="banner ok">{{ msg }}</div>{% endif %}
+{% if err %}<div class="banner warn">✗ {{ err }}</div>{% endif %}
+
+{% if not mgmt_ready %}
+<div class="banner warn">
+  {{ t('管理操作已禁用') }} — {{ t('面板环境未设置') }} <code>PROXY_CONTROL_URL</code>。
+  {{ t('本页面为只读') }}；{{ t('下方的出口可观测性仍来自共享主库') }}。
+</div>
+{% endif %}
+
+<section class="card">
+  <h3>{{ t('出口健康（每 数据源 × 代理）') }}</h3>
+  <div hx-get="/panel/partials/proxy" hx-trigger="load, every {{ poll_seconds }}s [document.visibilityState === 'visible']">
+    <p class="muted">{{ t('加载中') }}…</p>
+  </div>
+  <p class="muted">{{ t('冷表快照（近实时）') }}；{{ t('热状态在') }} proxy-redis.</p>
+</section>
+
+<div class="home-grid">
+  <section class="card">
+    <h3>{{ t('提供商') }}</h3>
+    <table>
+      <thead>
+      <tr>{{ th(t('提供商')) }}{{ th(t('活跃')) }}{{ th(t('退役')) }}</tr>
+      </thead>
+      {% for pr in providers %}
+      <tr><td>{{ pr.name }}</td><td>{{ pr.active }}</td><td>{{ pr.retired }}</td></tr>
+      {% else %}
+      <tr><td colspan="3" class="muted">{{ t('没有提供商所有的代理行') }}</td></tr>
+      {% endfor %}
+    </table>
+  </section>
+
+  <section class="card">
+    <h3>{{ t('导入静态端点') }}</h3>
+    <form method="post" action="/panel/proxy/import">
+      <label>{{ t('提供商名称') }}
+        <input type="text" name="provider" value="paid-static"></label>
+      <label>{{ t('端点列表，每行一个') }}: <code>ip|port|user|pass</code>
+        <textarea name="text" rows="5" class="mono-block"
+                  placeholder="122.0.0.1|8080|user|pass" {% if not mgmt_ready %}disabled{% endif %}></textarea></label>
+      <p><button class="btn" type="submit" {% if not mgmt_ready %}disabled{% endif %}>{{ t('导入') }}</button></p>
+    </form>
+  </section>
+</div>
+
+<div class="home-grid">
+  <section class="card">
+    <h3>{{ t('地址') }}</h3>
+    <table>
+      <thead>
+      <tr>{{ th('ID') }}{{ th(t('提供商')) }}{{ th(t('端点')) }}{{ th(t('凭证')) }}{{ th(t('状态')) }}<th></th></tr>
+      </thead>
+      {% for p in proxies %}
+      <tr>
+        <td>{{ p.id }}</td>
+        <td>{{ p.provider }}</td>
+        <td><code>{{ p.scheme }}://{{ p.ip }}:{{ p.port }}</code></td>
+        <td class="muted">{{ p.auth_masked }}</td>
+        <td><span class="badge {% if p.status == 'active' %}success{% else %}failed{% endif %}">{{ p.status }}</span></td>
+        <td>
+          {% if mgmt_ready %}
+          <form class="inline-form" method="post" action="/panel/proxy/{{ p.id }}/status">
+            <input type="hidden" name="status" value="{{ 'retired' if p.status == 'active' else 'active' }}">
+            <button class="link" type="submit">{{ t('退役') if p.status == 'active' else t('重新启用') }}</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="muted">{{ t('没有代理行') }}</td></tr>
+      {% endfor %}
+    </table>
+  </section>
+
+  <section class="card">
+    <h3>{{ t('每源限速') }}</h3>
+    <table>
+      <thead>
+      <tr>{{ th(t('数据源')) }}{{ th(t('最大 QPS')) }}{{ th(t('并发')) }}<th></th></tr>
+      </thead>
+      {% for r in rate_limits %}
+      {#- form lives inside a td; inputs/buttons join it via the form attribute
+          (a <form> wrapping <td>s would be invalid HTML) -#}
+      {% set rlform = 'rl-' ~ loop.index %}
+      <tr>
+        <td><form id="{{ rlform }}" class="inline-form" method="post" action="/panel/proxy/rate-limits/{{ r.source }}"></form>{{ r.source }}{% if not r.throttled %} <span class="muted">（{{ t('关') }}）</span>{% endif %}</td>
+        <td><input type="number" step="0.1" name="max_qps" value="{{ r.max_qps }}" form="{{ rlform }}"
+                   class="num-sm" aria-label="{{ r.source }} {{ t('最大 QPS') }}" {% if not mgmt_ready %}disabled{% endif %}></td>
+        <td><input type="number" name="max_concurrent" value="{{ r.max_concurrent }}" form="{{ rlform }}"
+                   class="num-xs" aria-label="{{ r.source }} {{ t('并发上限') }}" {% if not mgmt_ready %}disabled{% endif %}></td>
+        <td><button class="link" type="submit" form="{{ rlform }}" {% if not mgmt_ready %}disabled{% endif %}>{{ t('保存') }}</button></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="4" class="muted">{{ t('未配置限速（默认 1 QPS）') }}</td></tr>
+      {% endfor %}
+    </table>
+
+    <h3 class="mt">{{ t('强制熔断重置') }}</h3>
+    <form method="post" action="/panel/proxy/circuits/reset">
+      <div class="row2">
+        <span><label>{{ t('数据源') }}
+          <input type="text" name="source" placeholder="eastmoney" {% if not mgmt_ready %}disabled{% endif %}></label></span>
+        <span><label>{{ t('代理 ID') }}
+          <input type="number" name="proxy_id" {% if not mgmt_ready %}disabled{% endif %}></label></span>
+      </div>
+      <label>{{ t('操作员（可选）') }}
+        <input type="text" name="actor" placeholder="your name"></label>
+      <p><button class="btn" type="submit" {% if not mgmt_ready %}disabled{% endif %}>{{ t('重置为 HALF_OPEN') }}</button></p>
+      <p class="muted">{{ t('强制 OPEN → HALF_OPEN，绕过冷却') }}；{{ t('真实封禁会自动重新打开') }}。</p>
+    </form>
+  </section>
+</div>
+
+<section class="card mt">
+  <h3>{{ t('封禁规则（只读）') }}</h3>
+  <table>
+    <thead>
+    <tr>{{ th(t('数据源')) }}{{ th(t('类型')) }}{{ th(t('模式串')) }}{{ th(t('分类')) }}{{ th(t('启用')) }}</tr>
+    </thead>
+    {% for r in ban_rules %}
+    <tr>
+      <td>{{ r.source }}</td><td>{{ r.rule_type }}</td>
+      <td><code>{{ r.pattern }}</code></td>
+      <td><span class="badge {% if r.classification == 'ban' or r.classification == 'blocked' %}failed{% endif %}">{{ r.classification }}</span></td>
+      <td>{{ '✓' if r.enabled else '✗' }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="muted">{{ t('没有注册封禁规则') }}</td></tr>
+    {% endfor %}
+  </table>
+</section>
+{% endblock %}

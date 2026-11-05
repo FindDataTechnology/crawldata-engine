@@ -1,0 +1,1935 @@
+"""crawldata-engine FastMCP server.
+
+Exposes the ontology tools across six capabilities: catalog import, semantic
+layer, entity identity, source ranking, concept-fetch, and scheduled refresh.
+
+Entry: ``python -m fd_open_data_mcp.server``  (FastMCP, stdio transport)
+       ``crawldata-engine serve``
+"""
+from __future__ import annotations
+
+import hmac
+import logging
+import os
+
+from fastmcp import FastMCP
+
+from fd_open_data_mcp import engines
+from fd_open_data_mcp.annotations import annotations_for
+from fd_open_data_mcp.db import get_database
+from fd_open_data_mcp.search_cache import cached_search
+
+mcp = FastMCP(
+    name="crawldata-engine",
+    instructions=(
+        "Financial & economic data server. Call the FEWEST tools that answer the question; "
+        "do not fan out search tools in parallel (they overlap and return duplicate data).\n"
+        "• Known entity code (ticker AAPL, country code CN) -> get_entity(type, code). "
+        "Do not use search tools when the code is already known.\n"
+        "• Fuzzy / natural-language discovery ('concepts about X', 'Asian inflation') -> "
+        "ai_search. It is the superset of semantic_search / semantic_search_entities / "
+        "semantic_search_unified (concepts + entities + cached values). Call it ONCE; do not "
+        "also call the other three in parallel.\n"
+        "• Read a concrete value for entity+date -> read(concept_id, entity_type, entity_id, dates).\n"
+        "• Rank / inspect candidate sources for a concept -> rank_sources."
+    ),
+)
+
+# Attach the crawl-policy control-plane tools (add-fund-crawl-control-center).
+from fd_open_data_mcp.policy_tools import register_policy_tools
+
+register_policy_tools(mcp)
+
+# Attach the crawl-platform control tools (crawl-platform 4.3): platform source
+# inventory / run history + the same trigger/cancel operations the panel exposes.
+from fd_open_data_mcp.platform_tools import register_platform_tools
+
+register_platform_tools(mcp)
+
+# Attach the crawl-visibility tools (add-crawl-visibility): on-demand
+# `crawl_status` snapshot, shared with the scan/digest watcher entrypoints.
+from fd_open_data_mcp.visibility_tools import register_visibility_tools
+
+register_visibility_tools(mcp)
+
+# Attach the coverage-expansion tools (expand-crawl-coverage): read-only
+# `coverage_report` gap inventory, shared with the `coverage` CLI and the
+# digest's coverage section.
+from fd_open_data_mcp.coverage_tools import register_coverage_tools
+
+register_coverage_tools(mcp)
+
+# Attach the authenticated-crawling identity-pool tools (session-pool 4.2):
+# pool overview / event stream / login-required registration. Reads share the
+# aggregations the Console auth panel renders; the write only records rows —
+# logins happen on the login site.
+from fd_open_data_mcp.auth_tools import register_auth_tools
+
+register_auth_tools(mcp)
+
+
+def _session():
+    return get_database().get_session()
+
+
+# ─── Catalog ────────────────────────────────────────────────────────────────
+@mcp.tool(annotations=annotations_for("import_catalog"))
+def import_catalog(provider: str | None = None) -> dict:
+    """Import one (by name) or all fd-* provider registries into the catalog."""
+    from fd_open_data_mcp.catalog.importer import import_all, import_provider
+
+    if provider:
+        return import_provider(provider)
+    return {"providers": import_all()}
+
+
+@mcp.tool(annotations=annotations_for("register_datasource"))
+def register_datasource(manifest_path: str) -> dict:
+    """Register a datasource manifest into the ontology database.
+
+    Args:
+        manifest_path: Path to YAML/JSON manifest file, or Python module path "pkg.mod:CATALOG"
+
+    Returns:
+        Summary of registration result with counts of registered entities/functions/concepts
+    """
+    from fd_open_data_protocol.loader import load_catalog
+    from fd_open_data_mcp.catalog.register import register_datasource as _register
+
+    s = _session()
+    try:
+        manifest = load_catalog(manifest_path)
+        result = _register(manifest, s)
+        # Add entity definitions count for clarity
+        return {
+            "name": manifest.name,
+            "functions": result.get("functions", 0),
+            "columns": result.get("columns", 0),
+            "concepts": result.get("concepts", 0),
+            "bindings": result.get("bindings", 0),
+            "entities": result.get("entities", 0),
+            "entity_definitions": result.get("entity_definitions", 0),
+            "relationships": result.get("relationships", 0),
+        }
+    finally:
+        s.close()
+
+
+# ─── Write operations ───────────────────────────────────────────────────────
+@mcp.tool(annotations=annotations_for("update_entity"))
+def update_entity(
+    entity_type: str,
+    code: str,
+    name_en: str | None = None,
+    name_zh: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Update or create an entity in the ontology database.
+
+    This is an admin tool for updating entity metadata after initial registration.
+
+    Args:
+        entity_type: Entity type (country, stock, industry, etc.)
+        code: Entity canonical identifier (ISO code, ticker, classification code)
+        name_en: Optional English name override
+        name_zh: Optional Chinese name override
+        metadata: Optional metadata dict (merged with existing)
+
+    Returns:
+        {status: "created"|"updated", entity_type, code, id}
+    """
+    from pydantic import BaseModel, Field
+
+    class UpdateEntityParams(BaseModel):
+        entity_type: str = Field(..., description="Entity type")
+        code: str = Field(..., description="Canonical ID")
+        name_en: str | None = None
+        name_zh: str | None = None
+        metadata: dict | None = None
+
+    params = UpdateEntityParams(entity_type=entity_type, code=code, name_en=name_en, name_zh=name_zh, metadata=metadata)
+
+    from fd_open_data_mcp.catalog.register import upsert_entity
+    from fd_open_data_mcp.models import Entity
+
+    s = _session()
+    try:
+        # Create a minimal entity spec from params
+        class EntitySpec:
+            def __init__(self, p):
+                self.entity_type = p.entity_type
+                self.code = p.code
+                self.name_en = p.name_en
+                self.name_zh = p.name_zh
+                self.metadata = p.metadata
+                self.relationships = None
+
+        entity_spec = EntitySpec(params)
+        entity, status = upsert_entity(s, entity_spec, source_name="admin_update")
+        s.commit()
+        # Entity write: drop the cached graph + cached search results now,
+        # not after the TTL (engines/search_cache singletons).
+        engines.invalidate_graph()
+        engines.invalidate_searches()
+        return {"status": status, "entity_type": entity.entity_type, "code": entity.code, "id": entity.id}
+    except Exception as e:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("update_concept"))
+def update_concept(
+    concept_code: str,
+    entity_type: str,
+    name_en: str | None = None,
+    name_zh: str | None = None,
+    verified: bool | None = None,
+) -> dict:
+    """Update concept metadata (name, verification status).
+
+    Args:
+        concept_code: Concept code to update
+        entity_type: Entity type filter
+        name_en: Optional English name update
+        name_zh: Optional Chinese name update
+        verified: Optional verified flag update
+
+    Returns:
+        {affected_count: N, concept_ids: [...]}
+    """
+    from fd_open_data_mcp.models import Concept
+
+    s = _session()
+    try:
+        q = s.query(Concept).filter_by(code=concept_code, entity_type=entity_type)
+        affected_count = 0
+        concept_ids = []
+        for concept in q:
+            if name_en is not None and concept.name_en != name_en:
+                concept.name_en = name_en
+            if name_zh is not None and concept.name_zh != name_zh:
+                concept.name_zh = name_zh
+            if verified is not None and concept.verified != verified:
+                concept.verified = verified
+            affected_count += 1
+            concept_ids.append(concept.id)
+
+        s.commit()
+        # Concept write: cached search results are stale — drop them now.
+        engines.invalidate_searches()
+        return {"affected_count": affected_count, "concept_ids": concept_ids}
+    except Exception as e:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("update_binding"))
+def update_binding(
+    column_id: int,
+    concept_code: str,
+    entity_type: str,
+    confidence: float | None = None,
+    provenance: str | None = None,
+    reviewed: bool | None = None,
+) -> dict:
+    """Update concept binding confidence/provenance/review status.
+
+    Args:
+        column_id: FunctionColumn.id to update
+        concept_code: Target concept code
+        entity_type: Target entity type
+        confidence: Optional confidence score update
+        provenance: Optional provenance update (llm/manual/admin)
+        reviewed: Optional reviewed flag update
+
+    Returns:
+        {affected_count: N, binding_ids: [...]}
+    """
+    from fd_open_data_mcp.models import ConceptBinding, Concept
+
+    s = _session()
+    try:
+        # Resolve concept to ID
+        concept = s.query(Concept).filter_by(code=concept_code, entity_type=entity_type).first()
+        if concept is None:
+            return {"error": f"Concept not found: {concept_code}/{entity_type}", "affected_count": 0}
+
+        q = s.query(ConceptBinding).filter_by(concept_id=concept.id, column_id=column_id)
+        affected_count = 0
+        binding_ids = []
+
+        for binding in q:
+            updated = False
+            if confidence is not None and binding.confidence != confidence:
+                binding.confidence = confidence
+                updated = True
+            if provenance is not None and binding.provenance != provenance:
+                binding.provenance = provenance
+                updated = True
+            if reviewed is not None and binding.reviewed != reviewed:
+                binding.reviewed = reviewed
+                updated = True
+
+            if updated:
+                affected_count += 1
+                binding_ids.append(binding.id)
+
+        s.commit()
+        return {"affected_count": affected_count, "binding_ids": binding_ids}
+    except Exception as e:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+
+
+# ─── Semantic layer ─────────────────────────────────────────────────────────
+@mcp.tool(annotations=annotations_for("consume_concepts"))
+def consume_concepts() -> dict:
+    """Seed concept families + variables from the protocol vocabulary."""
+    from fd_open_data_mcp.semantic.concepts import consume_indicator_defs
+
+    s = _session()
+    try:
+        return consume_indicator_defs(s)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("propose_bindings"))
+def propose_bindings() -> dict:
+    """Propose column->concept bindings (propose-and-confirm; below-threshold withheld)."""
+    from fd_open_data_mcp.semantic.bindings import propose_bindings as _propose
+
+    s = _session()
+    try:
+        return _propose(s)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("list_concepts"))
+def list_concepts(
+    entity_type: str | None = None, concept_family: str | None = None,
+    query: str | None = None,
+    limit: int = 500, offset: int = 0,
+) -> list[dict]:
+    """List concepts (Variables) with their concept family; optionally filtered.
+
+    Paginated: rows are ordered by (entity_type, code, id) and a page returns at
+    most ``limit`` rows (clamped to 1000). Page with increasing ``offset`` until
+    a page comes back shorter than ``limit`` — that enumerates the full catalog
+    even when one entity type exceeds the per-call cap.
+
+    The catalog also serves verified entries of the unified indicator registry
+    (world_bank / gta_panel / china_city_panel / fd_open_data mirror sources).
+    Registry rows are appended after the native rows, ordered by
+    (domain, semantic_code); they carry additive ``native_code`` and
+    ``source_db`` fields, so an entry is findable by either identifier, and a
+    ``read_via`` hint naming the domain tool that serves its values. Reading
+    a registry-only indicator: pass its semantic_code (or native_code) as
+    ``concept_id`` to ``read`` / ``read_series`` — the read routes
+    transparently through the indicator's source-database read channel.
+    Entries whose semantic_code duplicates a non-deprecated native concept
+    code are deduped (native row wins); deprecated legacy rows never shadow a
+    verified entry.
+
+    Args:
+        entity_type: restrict to one entity type (country, stock, ...)
+            — registry rows carry no entity type and are excluded by this filter
+        concept_family: restrict to one concept family id (GDP, Population, ...)
+            — registry rows carry no family and are excluded by this filter
+        query: optional case-insensitive substring matched against
+            code / name_en / name_zh (and native_code on registry rows);
+            default None = unfiltered
+        limit: page size, 1..1000 (default 500)
+        offset: rows to skip (default 0)
+    """
+    from fd_open_data_mcp.semantic.concepts import list_concepts_with_family
+
+    s = _session()
+    try:
+        return list_concepts_with_family(
+            s, entity_type=entity_type, concept_family=concept_family,
+            query=query, limit=limit, offset=offset,
+        )
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("list_concept_families"))
+def list_concept_families(limit: int = 500, offset: int = 0) -> list[dict]:
+    """List the concept families (the curated semantic vocabulary) + variable counts.
+
+    Paginated with the same ``limit`` (1..1000) / ``offset`` semantics as
+    ``list_concepts``, ordered by family code.
+    """
+    from fd_open_data_mcp.semantic.concepts import list_concept_families as _list
+
+    s = _session()
+    try:
+        return _list(s, limit=limit, offset=offset)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("list_registry_entries"))
+def list_registry_entries(
+    status: str | None = None, limit: int = 500, offset: int = 0,
+    scope: str | None = None,
+) -> list[dict] | dict:
+    """Enumerate the WHOLE unified indicator registry — verified AND not.
+
+    The registration-surface enumeration channel (tiered browsing sync, e.g.
+    the public indicator catalog): every registered entry, each carrying its
+    authoritative ``verified`` flag (true = directly readable caliber,
+    false = registered/on-demand caliber). This is deliberately PARALLEL to
+    the catalog: ``list_concepts`` / ai_search / read keep their verified
+    gate untouched — unverified entries stay out of the catalog, search and
+    every read channel, and this tool does not change that.
+
+    Paginated like ``list_concepts``: rows ordered by (source_db, native_code),
+    ``limit`` clamped to 1..1000; page with increasing ``offset`` until a page
+    comes back shorter than ``limit`` — that enumerates the full registry
+    (57k+ entries at ~1000/page).
+
+    Args:
+        status: None = all entries (default); "verified" = only the verified
+            subset; "registered" = only the not-verified subset (never-yet-
+            reviewed rows count as registered). Any other value is an
+            explicit ``invalid_status`` error.
+        limit: page size, 1..1000 (default 500)
+        offset: rows to skip (default 0)
+        scope: optional named retrieval scope (see scope_list). This tool is
+            cross-source, so the scope's allow-lists filter the returned rows
+            (source_db above all — 「源即 scope」); the response then names the
+            scope that governed it, so a scope-emptied page is distinguishable
+            from true absence. An unknown scope is an explicit
+            ``unknown_scope`` error, never an empty result.
+    """
+    from fd_open_data_mcp.semantic.registry_catalog import list_registry_entries as _list
+
+    if status is not None and status not in ("verified", "registered"):
+        return {
+            "error": "invalid_status",
+            "detail": (
+                f"status must be omitted/None (all entries), 'verified' "
+                f"or 'registered'; got {status!r}"
+            ),
+        }
+
+    resolved, error = _resolve_scope_for_search(scope)
+    if error is not None:
+        return error
+
+    s = _session()
+    try:
+        rows = _list(s, status=status, limit=limit, offset=offset)
+    finally:
+        s.close()
+
+    if resolved is None:
+        return rows
+    # Scoped cross-source enumeration (indicator-scope D4): the scope's
+    # allow-lists filter the page's rows — every dimension applies, registry
+    # rows carry source_db / native_code / semantic_code / domain. The
+    # payload names the scope so scoped emptiness is explainable, and the
+    # per-(scope, day) hit counters see the call.
+    return _finish_scoped_search(
+        resolved, {"entries": rows, "count": len(rows)}, result_key="entries",
+    )
+
+
+@mcp.tool(annotations=annotations_for("record_concept_mapping"))
+def record_concept_mapping(
+    concept_id: int,
+    vocabulary: str,
+    term: str,
+    relation: str,
+    confidence: float = 1.0,
+    provenance: str = "manual",
+    reviewed: bool = False,
+) -> dict:
+    """Assert that a Variable maps to an external vocabulary term.
+
+    Args:
+        concept_id: Variable (concepts.id) being mapped
+        vocabulary: external vocabulary, e.g. datacommons / worldbank / wikidata / xbrl-us-gaap / sdmx
+        term: the external identifier or code, e.g. SP.POP.TOTL or Q148
+        relation: SKOS mapping property — exact / close / broader / narrower / related
+        confidence: 0..1; below the review threshold it is flagged pending review
+        provenance: registry / manual / llm
+        reviewed: mark the assertion as reviewed
+
+    Returns:
+        {mapping: {...}, created: bool}
+    """
+    from fd_open_data_mcp.semantic.crosswalk import record_mapping
+
+    s = _session()
+    try:
+        row, created = record_mapping(
+            s, concept_id, vocabulary, term, relation,
+            confidence=confidence, provenance=provenance, reviewed=reviewed,
+        )
+        s.commit()
+        return {"mapping": row.toDict(), "created": created}
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("list_concept_mappings"))
+def list_concept_mappings(
+    concept_id: int | None = None,
+    vocabulary: str | None = None,
+    term: str | None = None,
+) -> list[dict]:
+    """List concept mappings forward (by Variable) or in reverse (by external term).
+
+    Args:
+        concept_id: restrict to one Variable
+        vocabulary: restrict to one external vocabulary
+        term: restrict to one external term — with `vocabulary` this is the
+            reverse lookup ("which Variables map to SP.POP.TOTL?")
+
+    Returns:
+        Mappings with relation, confidence, provenance, review state, the
+        Variable they belong to, and a `pending_review` flag.
+    """
+    from fd_open_data_mcp.semantic.crosswalk import list_mappings
+
+    s = _session()
+    try:
+        return list_mappings(s, concept_id=concept_id, vocabulary=vocabulary, term=term)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("import_crosswalks"))
+def import_crosswalks() -> dict:
+    """Ingest the shipped crosswalk registry (crosswalks/*.yaml) as mappings."""
+    from fd_open_data_mcp.semantic.crosswalk import import_crosswalks as _import
+
+    s = _session()
+    try:
+        return _import(s)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("list_bindings"))
+def list_bindings(concept_code: str | None = None) -> list[dict]:
+    """List column->concept bindings (optionally filtered by concept code)."""
+    from fd_open_data_mcp.models import Concept, ConceptBinding
+
+    s = _session()
+    try:
+        q = s.query(ConceptBinding)
+        if concept_code:
+            c = s.query(Concept).filter_by(code=concept_code).first()
+            if c is not None:
+                q = q.filter_by(concept_id=c.id)
+        return [b.toDict() for b in q.limit(500).all()]
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("review_bindings"))
+def review_bindings() -> list[dict]:
+    """Return the below-threshold review queue (propose-and-confirm)."""
+    from fd_open_data_mcp.semantic.bindings import review_queue
+
+    s = _session()
+    try:
+        return [b.toDict() for b in review_queue(s)]
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("confirm_binding"))
+def confirm_binding(binding_id: int) -> dict:
+    """Confirm a binding in the review queue (provenance -> manual)."""
+    from fd_open_data_mcp.semantic.bindings import confirm_binding as _confirm
+
+    s = _session()
+    try:
+        b = _confirm(s, binding_id)
+        return b.toDict() if b is not None else {"error": "binding not found"}
+    finally:
+        s.close()
+
+
+# ─── Entity identity ────────────────────────────────────────────────────────
+@mcp.tool(annotations=annotations_for("seed_entity_identifiers"))
+def seed_entity_identifiers() -> dict:
+    """Seed akshare/yfinance (stocks) and worldbank (countries) identifier mappings."""
+    from fd_open_data_mcp.entities.resolver import (
+        seed_country_identifiers, seed_stock_identifiers,
+    )
+
+    s = _session()
+    try:
+        return {"stocks": seed_stock_identifiers(s), "countries": seed_country_identifiers(s)}
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("resolve_entity"))
+def resolve_entity(
+    entity_type: str | None = None,
+    entity_id: int | None = None,
+    source: str | None = None,
+    identifier: str | None = None,
+) -> dict:
+    """Resolve an entity <-> per-source identifier, in either direction.
+
+    Forward (entity -> identifier), the default:
+        resolve_entity(entity_type="country", entity_id=1, source="worldbank")
+        -> {"identifier": "CN"}   (or null when that source has no mapping)
+
+    Reverse (external anchor -> entity), pass `identifier` instead of the
+    entity: `wikidata` (QID, e.g. Q148) and `datacommons` (DCID, e.g.
+    country/CHN) are the anchor sources.
+        resolve_entity(source="wikidata", identifier="Q148")
+        -> {"match": {"entity_type": "country", "code": "CN", ...}}
+        An identifier no entity carries returns {"match": null}, not an error.
+    """
+    from fd_open_data_mcp.entities.resolver import (
+        find_entity_by_identifier, resolve_identifier,
+    )
+
+    s = _session()
+    try:
+        if identifier is not None:
+            if not source:
+                return {"match": None, "error": "source is required with identifier"}
+            match = find_entity_by_identifier(s, source, identifier)
+            if match is None:
+                return {"match": None, "note": "no entity carries this identifier"}
+            return {"match": match}
+
+        if not (entity_type and source) or entity_id is None:
+            return {"identifier": None,
+                    "error": "pass (entity_type, entity_id, source) or (source, identifier)"}
+        ident = resolve_identifier(s, entity_type, entity_id, source)
+        return {"identifier": ident} if ident else {
+            "identifier": None, "note": "no mapping; source will be skipped"}
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("add_entity_identifier"))
+def add_entity_identifier(entity_type: str, entity_id: int, source: str, identifier: str) -> dict:
+    """Upsert a per-source entity identifier."""
+    from fd_open_data_mcp.entities.resolver import add_identifier
+
+    s = _session()
+    try:
+        return add_identifier(s, entity_type, entity_id, source, identifier).toDict()
+    finally:
+        s.close()
+
+
+# ─── Entity graph ────────────────────────────────────────────────────────────
+@mcp.tool(annotations=annotations_for("list_entities"))
+def list_entities(entity_type: str, limit: int = 100, offset: int = 0) -> list[dict]:
+    """List entities of a specific type."""
+    from fd_open_data_mcp.entity_graph_tools import list_entities as _list
+
+    return _list(entity_type, limit, offset)
+
+
+@mcp.tool(annotations=annotations_for("get_entity"))
+def get_entity(entity_type: str, code: str) -> dict | None:
+    """Look up one entity by exact type+code (ticker AAPL, country CN).
+    Use when the code is known; do not use search tools for this."""
+    from fd_open_data_mcp.entity_graph_tools import get_entity as _get
+
+    return _get(entity_type, code)
+
+
+@mcp.tool(annotations=annotations_for("add_entity"))
+def add_entity(
+    entity_type: str,
+    code: str,
+    name_en: str | None = None,
+    name_zh: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Add a new entity to the registry."""
+    from fd_open_data_mcp.entity_graph_tools import add_entity as _add
+
+    result = _add(entity_type, code, name_en, name_zh, metadata)
+    engines.invalidate_graph()
+    engines.invalidate_searches()
+    return result
+
+
+@mcp.tool(annotations=annotations_for("list_relationships"))
+def list_relationships(entity_type: str, code: str, direction: str = "outgoing") -> list[dict]:
+    """List relationships for an entity."""
+    from fd_open_data_mcp.entity_graph_tools import list_relationships as _list
+
+    return _list(entity_type, code, direction)
+
+
+@mcp.tool(annotations=annotations_for("add_relationship"))
+def add_relationship(
+    source_entity_type: str,
+    source_code: str,
+    relation_type: str,
+    target_entity_type: str,
+    target_code: str,
+    valid_from: str | None = None,
+    valid_to: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Add a new relationship between two entities."""
+    from fd_open_data_mcp.entity_graph_tools import add_relationship as _add
+
+    result = _add(source_entity_type, source_code, relation_type, target_entity_type, target_code, valid_from, valid_to, metadata)
+    engines.invalidate_graph()
+    engines.invalidate_searches()
+    return result
+
+
+# ─── Graph search (NetworkX) ─────────────────────────────────────────────────
+@mcp.tool(annotations=annotations_for("graph_search"))
+def graph_search(
+    algorithm: str,
+    start_entity_code: str,
+    end_entity_code: str | None = None,
+    max_depth: int = 3,
+    entity_type_filter: str | None = None,
+) -> dict:
+    """Perform graph-based entity relationship queries using NetworkX.
+
+    Args:
+        algorithm: Graph algorithm to use. Options:
+            - "bfs": Breadth-first search traversal
+            - "dfs": Depth-first search traversal
+            - "neighbors": Get direct neighbors
+            - "shortest_path": Find shortest path between two entities
+            - "subgraph": Extract subgraph by entity type
+            - "ego_graph": Extract ego graph centered on entity
+            - "statistics": Get graph statistics
+        start_entity_code: Starting entity code (e.g., "AAPL", "CN")
+        end_entity_code: Ending entity code (required for shortest_path)
+        max_depth: Maximum traversal depth (default: 3)
+        entity_type_filter: Filter results by entity type (e.g., "country", "stock")
+
+    Returns:
+        Dictionary with query results depending on algorithm:
+        - bfs/dfs: List of entities with depth info
+        - neighbors: List of neighbor entities with relationship info
+        - shortest_path: List of entities in the path
+        - subgraph/ego_graph: Dict with nodes and edges
+        - statistics: Graph statistics (node count, edge count, etc.)
+
+    Examples:
+        # BFS traversal from Apple
+        graph_search("bfs", "AAPL", max_depth=2)
+
+        # Shortest path from Apple to China
+        graph_search("shortest_path", "AAPL", "CN")
+
+        # Get all neighbors of Apple
+        graph_search("neighbors", "AAPL")
+
+        # Get graph statistics
+        graph_search("statistics", "")
+    """
+    # Shared singleton: the graph (and its TTL cache) survives across calls
+    # (engines.get_graph_manager; entity writes invalidate it explicitly).
+    from fd_open_data_mcp import engines as _engines
+
+    def _run() -> dict:
+        graph_manager = _engines.get_graph_manager()
+        try:
+            # Validate algorithm
+            valid_algorithms = ["bfs", "dfs", "neighbors", "shortest_path", "subgraph", "ego_graph", "statistics"]
+            if algorithm not in valid_algorithms:
+                return {
+                    "error": f"Invalid algorithm: {algorithm}. Valid options: {valid_algorithms}"
+                }
+
+            # Handle statistics (doesn't need start_entity_code)
+            if algorithm == "statistics":
+                return graph_manager.get_statistics()
+
+            # Validate start_entity_code
+            if not start_entity_code:
+                return {"error": "start_entity_code is required for this algorithm"}
+
+            # Find start node
+            start_node = graph_manager.find_node_by_code(start_entity_code, entity_type_filter)
+            if start_node is None:
+                return {"error": f"Entity not found: {start_entity_code}"}
+
+            # Execute algorithm
+            if algorithm == "bfs":
+                results = graph_manager.bfs_traversal(start_node, max_depth, entity_type_filter)
+                return {
+                    "algorithm": "bfs",
+                    "start_entity": start_entity_code,
+                    "max_depth": max_depth,
+                    "results": results,
+                    "count": len(results)
+                }
+
+            elif algorithm == "dfs":
+                results = graph_manager.dfs_traversal(start_node, max_depth, entity_type_filter)
+                return {
+                    "algorithm": "dfs",
+                    "start_entity": start_entity_code,
+                    "max_depth": max_depth,
+                    "results": results,
+                    "count": len(results)
+                }
+
+            elif algorithm == "neighbors":
+                results = graph_manager.get_neighbors(start_node, entity_type_filter)
+                return {
+                    "algorithm": "neighbors",
+                    "entity": start_entity_code,
+                    "results": results,
+                    "count": len(results)
+                }
+
+            elif algorithm == "shortest_path":
+                if not end_entity_code:
+                    return {"error": "end_entity_code is required for shortest_path algorithm"}
+
+                end_node = graph_manager.find_node_by_code(end_entity_code, entity_type_filter)
+                if end_node is None:
+                    return {"error": f"Entity not found: {end_entity_code}"}
+
+                results = graph_manager.shortest_path(start_node, end_node)
+                if not results:
+                    return {
+                        "algorithm": "shortest_path",
+                        "start_entity": start_entity_code,
+                        "end_entity": end_entity_code,
+                        "results": [],
+                        "message": "No path found between entities"
+                    }
+
+                return {
+                    "algorithm": "shortest_path",
+                    "start_entity": start_entity_code,
+                    "end_entity": end_entity_code,
+                    "results": results,
+                    "path_length": len(results) - 1
+                }
+
+            elif algorithm == "subgraph":
+                if not entity_type_filter:
+                    return {"error": "entity_type_filter is required for subgraph algorithm"}
+
+                results = graph_manager.get_subgraph_by_type(entity_type_filter, max_nodes=100)
+                return {
+                    "algorithm": "subgraph",
+                    "entity_type": entity_type_filter,
+                    "nodes": results["nodes"],
+                    "edges": results["edges"],
+                    "node_count": len(results["nodes"]),
+                    "edge_count": len(results["edges"])
+                }
+
+            elif algorithm == "ego_graph":
+                results = graph_manager.get_ego_graph(start_node, radius=max_depth)
+                return {
+                    "algorithm": "ego_graph",
+                    "center_entity": start_entity_code,
+                    "radius": max_depth,
+                    "nodes": results["nodes"],
+                    "edges": results["edges"],
+                    "node_count": len(results["nodes"]),
+                    "edge_count": len(results["edges"])
+                }
+
+        except Exception as e:
+            return {"error": f"Graph search failed: {str(e)}"}
+    return cached_search(
+        "graph_search",
+        {"algorithm": algorithm, "start_entity_code": start_entity_code,
+         "end_entity_code": end_entity_code, "max_depth": max_depth,
+         "entity_type_filter": entity_type_filter},
+        _run,
+    )
+
+
+# ─── Semantic search ────────────────────────────────────────────────────────
+def _resolve_scope_for_search(scope: str | None) -> tuple[dict | None, dict | None]:
+    """Resolve the effective scope for a search tool.
+
+    Returns ``(resolved, error)``: ``error`` is the explicit unknown-scope
+    payload when the caller named a scope that does not exist (never an empty
+    result set — spec「Unknown scope errors clearly」). Resolution happens
+    BEFORE the result cache so the cache key carries the effective scope and
+    differently-scoped callers never share an entry.
+    """
+    from fd_open_data_mcp import scoping
+
+    s = _session()
+    try:
+        try:
+            return scoping.resolve_scope(s, scope), None
+        except scoping.ScopeNotFound as exc:
+            return None, {
+                "error": "unknown_scope", "scope": exc.name,
+                "detail": str(exc),
+                "hint": "list known scopes with scope_list",
+            }
+    finally:
+        s.close()
+
+
+def _scope_cache_key(resolved: dict | None) -> str | None:
+    return resolved["name"] if resolved else None
+
+
+def _finish_scoped_search(resolved: dict | None, out: dict,
+                          result_key: str = "results") -> dict:
+    """Filter a search payload by the scope in effect + disclose it + count it.
+
+    Filtering happens after the merge with registry hits so both corpora are
+    constrained; the response always names the scope when one is in effect —
+    including (especially) when filtering leaves zero results (spec「Scoped
+    emptiness is explainable」). Unscoped calls return the payload untouched.
+    """
+    if resolved is None:
+        return out
+    from fd_open_data_mcp import scoping
+
+    filtered = scoping.filter_result_rows(out.get(result_key) or [], resolved["rules"])
+    out[result_key] = filtered
+    out["count"] = len(filtered)
+    out["scope"] = scoping.scope_metadata(resolved)
+    s = _session()
+    try:
+        scoping.record_hit(s, resolved["name"], len(filtered))
+    finally:
+        s.close()
+    return out
+
+
+@mcp.tool(annotations=annotations_for("semantic_search"))
+def semantic_search(
+    query: str,
+    entity_type: str | None = None,
+    frequency: str | None = None,
+    limit: int = 20,
+    scope: str | None = None,
+) -> dict:
+    """Search concepts semantically using vector embeddings.
+
+    Returns {cached, count, results}: results are the matching concepts with
+    scores, ordered by similarity; cached=true marks a TTL-cache hit. Pass
+    ``scope`` to constrain retrieval to a named scope (see scope_list); a
+    scoped response names the scope that governed it.
+    """
+    from fd_open_data_mcp.semantic_search import semantic_search as _search
+    from fd_open_data_mcp.semantic.registry_search import (
+        merge_registry_hits,
+        search_registry,
+        take_degraded_reason,
+    )
+
+    resolved, error = _resolve_scope_for_search(scope)
+    if error is not None:
+        return error
+
+    def run():
+        results = _search(query, entity_type, frequency, limit)
+        # Registry corpus (spec semantic-search「语料覆盖」): verified
+        # registry-only indicators join the ranking; local concepts win
+        # semantic_code collisions. Same binding-aware key as the concept
+        # search — registry entries carry no bindings.
+        registry_hits = search_registry(query, limit)
+        degraded = take_degraded_reason()
+
+        def _rank(c):
+            sim = c.get("similarity", 0.0)
+            return (round(sim / 0.05), 1 if c.get("has_binding") else 0, sim)
+
+        merged = merge_registry_hits(results, registry_hits, limit=limit, key=_rank)
+        out = {"count": len(merged), "results": merged}
+        if degraded:
+            # 本地结果仍然有效，故不整单失败；但"registry 没贡献"与"registry
+            # 取不到"必须可区分——前者是完整答案，后者是部分答案。
+            out["degraded"] = True
+            out["degraded_reason"] = degraded
+        return out
+
+    out = cached_search(
+        "semantic_search",
+        {"query": query, "entity_type": entity_type, "frequency": frequency,
+         "limit": limit, "scope": _scope_cache_key(resolved)},
+        run,
+    )
+    return _finish_scoped_search(resolved, out)
+
+
+@mcp.tool(annotations=annotations_for("semantic_search_entities"))
+def semantic_search_entities(
+    query: str,
+    entity_type: str | None = None,
+    limit: int = 20,
+) -> dict:
+    """Search entities semantically using vector embeddings.
+
+    Args:
+        query: Natural language query (e.g., "Asian countries", "technology companies")
+        entity_type: Optional filter by entity type (country, stock, industry, etc.)
+        limit: Maximum number of results to return
+
+    Returns:
+        {cached, count, results}: entities with similarity scores, sorted by
+        relevance; cached=true marks a TTL-cache hit.
+    """
+    search = engines.get_entity_search()
+
+    def run():
+        results = search.search(query, entity_type, limit)
+        return {"count": len(results), "results": results}
+
+    return cached_search(
+        "semantic_search_entities",
+        {"query": query, "entity_type": entity_type, "limit": limit},
+        run,
+    )
+
+
+@mcp.tool(annotations=annotations_for("semantic_search_unified"))
+def semantic_search_unified(
+    query: str,
+    entity_type: str | None = None,
+    limit: int = 20,
+    scope: str | None = None,
+) -> dict:
+    """Unified semantic search across both entities and concepts.
+
+    Args:
+        query: Natural language query
+        entity_type: Optional filter by entity type (applies to entities only)
+        limit: Maximum number of results to return
+        scope: Optional named retrieval scope constraining concept results
+
+    Returns:
+        {cached, count, results}: entities and concepts with similarity
+        scores, merged and sorted; cached=true marks a TTL-cache hit.
+    """
+    search = engines.get_entity_search()
+    from fd_open_data_mcp.semantic.registry_search import (
+        merge_registry_hits,
+        search_registry,
+        take_degraded_reason,
+    )
+
+    resolved, error = _resolve_scope_for_search(scope)
+    if error is not None:
+        return error
+
+    def run():
+        results = search.search_unified(query, entity_type, limit)
+        # Registry entries merge on the same similarity-descending order
+        # (spec「语料覆盖」); dedupe keeps the local concept on code collisions.
+        registry_hits = search_registry(query, limit)
+        merged = merge_registry_hits(
+            results, registry_hits, limit=limit,
+            key=lambda r: r.get("similarity", 0.0),
+        )
+        return {"count": len(merged), "results": merged}
+
+    out = cached_search(
+        "semantic_search_unified",
+        {"query": query, "entity_type": entity_type, "limit": limit,
+         "scope": _scope_cache_key(resolved)},
+        run,
+    )
+    return _finish_scoped_search(resolved, out)
+
+
+@mcp.tool(annotations=annotations_for("re_embed_concept"))
+def re_embed_concept(concept_id: int) -> dict:
+    """Re-embed a single concept."""
+    from fd_open_data_mcp.semantic_search import re_embed_concept as _re_embed
+
+    result = _re_embed(concept_id)
+    # Stored embeddings changed: cached search results are stale.
+    engines.invalidate_searches()
+    return result
+
+
+# ─── AI search (orchestrates all layers) ────────────────────────────────────
+@mcp.tool(annotations=annotations_for("ai_search"))
+def ai_search(
+    query: str,
+    entity_type: str | None = None,
+    limit: int = 20,
+    include_values: bool = False,
+    value_date: str | None = None,
+    scope: str | None = None,
+) -> dict:
+    """Default search entry point — call this for fuzzy/natural-language discovery.
+    Superset of semantic_search/semantic_search_entities/semantic_search_unified
+    (concepts + entities + cached values); do not call those in parallel with this.
+
+    Args:
+        query: Natural language query (e.g., "Asian inflation indicators")
+        entity_type: Filter by entity type (country, stock, industry, etc.)
+        limit: Maximum number of concepts to return
+        include_values: If True, fetch actual values from semantic_observations
+        value_date: Date for values (e.g., "2024-01-01") - only if include_values=True
+        scope: Optional named retrieval scope constraining the concepts list;
+            the response names the scope that governed it (see scope_list)
+
+    Returns:
+        Dictionary with concepts, entities, and optionally values; carries a
+        cached=true marker when served from the TTL result cache.
+    """
+    from fd_open_data_mcp.ai_search import ai_search as _ai_search
+    from fd_open_data_mcp.semantic.registry_search import (
+        merge_registry_hits,
+        search_registry,
+        take_degraded_reason,
+    )
+
+    resolved, error = _resolve_scope_for_search(scope)
+    if error is not None:
+        return error
+
+    def _run():
+        result = _ai_search(query, entity_type, limit, include_values, value_date)
+        # Registry-only indicators ride the concepts list tail so they stay
+        # discoverable even when zero local concepts match (spec「语料覆盖」);
+        # each carries result_type="registry", deduped against concept codes.
+        registry_hits = search_registry(query, limit)
+        result["concepts"] = merge_registry_hits(
+            result.get("concepts", []), registry_hits,
+        )
+        return result
+
+    out = cached_search(
+        "ai_search",
+        {
+            "query": query,
+            "entity_type": entity_type,
+            "limit": limit,
+            "include_values": include_values,
+            "value_date": value_date,
+            "scope": _scope_cache_key(resolved),
+        },
+        _run,
+    )
+    return _finish_scoped_search(resolved, out, result_key="concepts")
+
+
+# ─── Source ranking ─────────────────────────────────────────────────────────
+@mcp.tool(annotations=annotations_for("rank_sources"))
+def rank_sources(concept_id: int, requested_date: str | None = None) -> list[dict]:
+    """Rank candidate sources for a concept (best-first) with composite scores."""
+    from fd_open_data_mcp.ranking.scorer import rank_sources_for_concept
+
+    s = _session()
+    try:
+        return rank_sources_for_concept(s, concept_id, requested_date)
+    finally:
+        s.close()
+
+
+# ─── Retrieval scopes (indicator-scope) ─────────────────────────────────────
+def _scope_error(exc: Exception) -> dict:
+    """CRUD/validation failures as explicit payloads, not raises."""
+    from fd_open_data_mcp import scoping
+
+    if isinstance(exc, scoping.ScopeNotFound):
+        return {"error": "unknown_scope", "scope": exc.name, "detail": str(exc)}
+    return {"error": "invalid_scope", "detail": str(exc)}
+
+
+@mcp.tool(annotations=annotations_for("scope_create"))
+def scope_create(name: str, rules: dict, description: str | None = None) -> dict:
+    """Create a named retrieval scope.
+
+    rules: allow-lists over the registry dimensions —
+    ``{source_dbs: [...], domains: [...], semantic_codes: [...],
+    native_codes: [...]}`` (every list optional; a scope with no allow-lists
+    is rejected). Allow-list values are validated against the live
+    registry_entries/concepts tables: a scope matching nothing known is
+    rejected; the number of matched indicators is returned. ``unscoped`` is
+    reserved. Scope is a precision/cost tool, not a permission wall.
+    """
+    from fd_open_data_mcp import scoping
+
+    s = _session()
+    try:
+        return scoping.scope_create(s, name, rules, description)
+    except Exception as exc:  # noqa: BLE001 — surfaced as explicit payloads
+        s.rollback()
+        return _scope_error(exc)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("scope_list"))
+def scope_list() -> list[dict]:
+    """List every retrieval scope with its allow-list rules."""
+    from fd_open_data_mcp import scoping
+
+    s = _session()
+    try:
+        return scoping.scope_list(s)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("scope_update"))
+def scope_update(name: str, rules: dict | None = None,
+                 description: str | None = None) -> dict:
+    """Update a scope's rules and/or description (same validation as create)."""
+    from fd_open_data_mcp import scoping
+
+    s = _session()
+    try:
+        return scoping.scope_update(s, name, rules, description)
+    except Exception as exc:  # noqa: BLE001
+        s.rollback()
+        return _scope_error(exc)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("scope_delete"))
+def scope_delete(name: str) -> dict:
+    """Delete a scope (its caller default bindings go with it; stats remain)."""
+    from fd_open_data_mcp import scoping
+
+    s = _session()
+    try:
+        return scoping.scope_delete(s, name)
+    except Exception as exc:  # noqa: BLE001
+        s.rollback()
+        return _scope_error(exc)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("scope_bind_caller"))
+def scope_bind_caller(caller_key: str, scope_name: str) -> dict:
+    """Bind a caller's default scope (applies when the caller passes no
+    explicit scope; an explicit parameter — or the reserved ``unscoped`` —
+    always wins). ``caller_key`` is opaque: the ``X-FD-Caller`` request
+    header value for HTTP callers, or the FD_MCP_CALLER_KEY env identity for
+    integrations.
+    """
+    from fd_open_data_mcp import scoping
+
+    s = _session()
+    try:
+        return scoping.bind_caller(s, caller_key, scope_name)
+    except Exception as exc:  # noqa: BLE001
+        s.rollback()
+        return _scope_error(exc)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("scope_unbind_caller"))
+def scope_unbind_caller(caller_key: str) -> dict:
+    """Drop a caller's default scope binding."""
+    from fd_open_data_mcp import scoping
+
+    s = _session()
+    try:
+        return scoping.unbind_caller(s, caller_key)
+    except Exception as exc:  # noqa: BLE001
+        s.rollback()
+        return _scope_error(exc)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("scope_list_bindings"))
+def scope_list_bindings(caller_key: str | None = None) -> list[dict]:
+    """List caller default-scope bindings (optionally one caller's)."""
+    from fd_open_data_mcp import scoping
+
+    s = _session()
+    try:
+        return scoping.list_bindings(s, caller_key)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("scope_stats"))
+def scope_stats(scope_name: str, days: int = 30) -> dict:
+    """Per-day hit counters for one scope (calls, results_returned), most
+    recent first — the cost-savings evidence (spec「Scope effectiveness is
+    observable」). An unknown scope is an explicit error naming it."""
+    from fd_open_data_mcp import scoping
+
+    s = _session()
+    try:
+        return scoping.scope_stats(s, scope_name, days)
+    except Exception as exc:  # noqa: BLE001
+        s.rollback()
+        return _scope_error(exc)
+    finally:
+        s.close()
+
+
+def _local_concept_for_key(session, key):
+    """Return the non-deprecated Concept whose ``code`` matches ``key``.
+
+    Used only when a registry entry's source_db has no federated read channel,
+    so the entry can still be served from the local dictionary instead of
+    failing with ``no_read_channel`` (spec wire-indicator-catalog: verified
+    entries are advertised as 可直读). Returns None when nothing matches.
+    """
+    from fd_open_data_mcp.models import Concept
+
+    key_str = str(key).strip()
+    if not key_str:
+        return None
+    return (
+        session.query(Concept)
+        .filter(Concept.code == key_str, Concept.deprecated.is_(False))
+        .order_by(Concept.id)
+        .first()
+    )
+
+
+# ─── Concept-fetch ──────────────────────────────────────────────────────────
+@mcp.tool(annotations=annotations_for("read"))
+def read(concept_id: int | str, entity_type: str | None = None,
+         entity_id: int | None = None, dates: list[str] | None = None,
+         source: str | None = None, all_sources: bool = False,
+         entity: str | None = None, scope: str | None = None) -> list[dict]:
+    """Read a concept for an entity over dates (read-through cache + ranked dispatch).
+
+    Local concepts: concept_id is the numeric id; entity_type/entity_id/dates
+    are required; ``source`` pins the read (and any dispatch) to one source;
+    ``all_sources`` returns every held row per date, best-ranked first, without
+    dispatching — for cross-source comparison.
+
+    Registry-only indicators (catalog rows with id=None): pass the
+    semantic_code (or native_code) as ``concept_id`` — the read is routed
+    transparently through the indicator's source-database read channel and
+    returns the same row shape; ``entity`` carries the region/country/city
+    name when the channel needs one (world_bank requires it). Provenance
+    travels in ``source_used``.
+
+    ``scope`` (optional): restrict this call to a named retrieval scope — an
+    indicator outside the scope returns an explicit out-of-scope response;
+    the reserved name ``unscoped`` forces the full corpus.
+    """
+    from fd_open_data_mcp import federation, scoping
+    from fd_open_data_mcp.fetch.dispatch import read as _read
+    from fd_open_data_mcp.models import Concept
+
+    if dates is None:
+        raise ValueError("dates is required (list of 'YYYY-MM-DD' or 'YYYY')")
+
+    s = _session()
+    try:
+        try:
+            resolved = scoping.resolve_scope(s, scope)
+        except scoping.ScopeNotFound as exc:
+            return [{"error": "unknown_scope", "scope": exc.name, "detail": str(exc)}]
+
+        cid = concept_id if isinstance(concept_id, int) else None
+        if cid is None and isinstance(concept_id, str) and concept_id.strip().isdigit():
+            cid = int(concept_id.strip())
+        concept = s.get(Concept, cid) if cid is not None else None
+
+        if concept is not None:
+            # Local concept — the federation path is never consulted, so a
+            # business-mcp outage cannot touch this branch (spec「Local reads
+            # unaffected by federation outage」).
+            violation = scoping.check_read_scope(
+                resolved, code=concept.code, category=concept.category,
+            ) if resolved else None
+            if violation:
+                return [violation]
+            rows = _read(s, cid, entity_type, entity_id, dates,
+                         source=source, all_sources=all_sources)
+            if resolved:
+                scoping.record_hit(s, resolved["name"],
+                                   sum(1 for r in rows if not r.get("error")))
+            return rows
+
+        entry = federation.resolve_registry_entry(s, concept_id)
+        if entry is not None:
+            # A registry entry whose source_db owns a federated channel keeps
+            # routing to it exactly as before. Only a channel-less source_db
+            # may fall back to a local concept of the same code: those entries
+            # are advertised as 可直读 yet have no way to serve values, which
+            # the mirror-adapter source (fd_open_data) hits for every concept
+            # it registers (change industry-vertical-supply).
+            local = None
+            if entry.get("source_db") not in federation.SOURCE_DB_CHANNELS:
+                local = _local_concept_for_key(s, concept_id)
+            if local is not None:
+                rows = _read(s, local.id, entity_type, entity_id, dates,
+                             source=source, all_sources=all_sources)
+                if resolved:
+                    scoping.record_hit(s, resolved["name"],
+                                       sum(1 for r in rows if not r.get("error")))
+                return rows
+            # Registry-only indicator — route by source_db (design D1).
+            violation = scoping.check_read_scope(
+                resolved, code=entry.get("semantic_code"),
+                category=entry.get("domain"), source_db=entry.get("source_db"),
+                native_code=entry.get("native_code"),
+            ) if resolved else None
+            if violation:
+                return [violation]
+            rows = federation.federated_read(s, concept_id, dates, entity=entity)
+            if resolved:
+                scoping.record_hit(s, resolved["name"],
+                                   sum(1 for r in rows if not r.get("error")))
+            return rows
+
+        # Neither local nor registry: keep the local path's exact error
+        # behavior (check_applicability raises "concept X not found").
+        return _read(s, concept_id, entity_type, entity_id, dates,
+                     source=source, all_sources=all_sources)
+    finally:
+        s.close()
+
+
+MAX_SERIES_ROWS = 5000
+
+
+@mcp.tool(annotations=annotations_for("read_series"))
+def read_series(concept_id: int | str, entity_type: str | None = None,
+                entity_id: int | None = None, start: str = "", end: str = "",
+                entity: str | None = None, scope: str | None = None,
+                fill_gaps: bool = False) -> dict:
+    """Read a series for one concept x entity over [start, end].
+
+    Local concepts (numeric ``concept_id``): serves the stored cache only,
+    highest-ranked source per point, ordered by date. It NEVER dispatches
+    upstream — an empty window is a coverage fact reported as such, not a
+    failure. Use ``read`` for a point read (cache + live dispatch) or
+    ``fetch`` to force a refresh of one point.
+
+    Registry-only indicators (semantic_code / native_code as ``concept_id``):
+    the window is routed transparently through the indicator's source
+    database read channel (same response shape; ``entity`` carries the
+    region/country/city when the channel needs one). Provenance travels in
+    each point's ``source_used``.
+
+    ``scope`` (optional): restrict this call to a named retrieval scope —
+    out-of-scope indicators return an explicit out-of-scope response; the
+    reserved name ``unscoped`` forces the full corpus.
+
+    Args:
+        concept_id: concept (local numeric id, or registry semantic_code)
+        entity_type: entity type (country, stock, fund, ...) — local reads
+        entity_id: entity id — local reads
+        start: window start, inclusive ('YYYY-MM-DD'; a bare 'YYYY' works)
+        end: window end, inclusive
+        entity: region / country / city name for registry-only reads
+        scope: optional named retrieval scope
+        fill_gaps: fetch the missing intervals of this window (price concepts
+            only, additive — never overwrites a stored value)
+    """
+    from fd_open_data_mcp import federation, scoping
+    from fd_open_data_mcp.entities.resolver import check_applicability
+    from fd_open_data_mcp.fetch.cache import read_cache_range
+    from fd_open_data_mcp.fetch.dispatch import _coerce_value
+    from fd_open_data_mcp.models import Concept
+
+    if not start or not end:
+        raise ValueError("start and end are required (e.g. '2020-01-01')")
+    if start > end:
+        raise ValueError(f"start ({start}) is after end ({end})")
+
+    s = _session()
+    try:
+        try:
+            resolved = scoping.resolve_scope(s, scope)
+        except scoping.ScopeNotFound as exc:
+            return {"error": "unknown_scope", "scope": exc.name, "detail": str(exc)}
+
+        cid = concept_id if isinstance(concept_id, int) else None
+        if cid is None and isinstance(concept_id, str) and concept_id.strip().isdigit():
+            cid = int(concept_id.strip())
+        concept = s.get(Concept, cid) if cid is not None else None
+
+        if concept is None:
+            entry = federation.resolve_registry_entry(s, concept_id)
+            if entry is not None:
+                # Same fallback as `read`: only a source_db with no federated
+                # channel may be served from the local concept dictionary.
+                # Sources that DO own a channel are untouched.
+                if entry.get("source_db") not in federation.SOURCE_DB_CHANNELS:
+                    local = _local_concept_for_key(s, concept_id)
+                    if local is not None:
+                        concept = local
+                        cid = local.id
+                if concept is None:
+                    violation = scoping.check_read_scope(
+                        resolved, code=entry.get("semantic_code"),
+                        category=entry.get("domain"),
+                        source_db=entry.get("source_db"),
+                        native_code=entry.get("native_code"),
+                    ) if resolved else None
+                    if violation:
+                        return violation
+                    out = federation.federated_read_series(
+                        s, concept_id, start, end, entity=entity,
+                    )
+                    if resolved:
+                        scoping.record_hit(s, resolved["name"], out.get("count", 0))
+                    return out
+            if concept is None:
+                cid = concept_id  # neither local nor registry: local error behavior
+
+        check_applicability(s, cid, entity_type)
+        violation = scoping.check_read_scope(
+            resolved, code=concept.code, category=concept.category,
+        ) if (resolved and concept is not None) else None
+        if violation:
+            return violation
+        rows = read_cache_range(s, cid, entity_type, entity_id, start, end)
+        if fill_gaps:
+            from fd_open_data_mcp.fetch.gapfill import fill_gaps as _fill
+
+            filled = _fill(s, cid, entity_type, entity_id, start, end)
+            points = filled["points"]
+            truncated = len(points) > MAX_SERIES_ROWS
+            kept_points = points[-MAX_SERIES_ROWS:] if truncated else points
+            out: dict = {
+                "concept_id": cid, "entity_type": entity_type, "entity_id": entity_id,
+                "start": start, "end": end, "count": len(kept_points),
+                "points": kept_points,
+                "gaps": filled["gaps"],
+                "fill_attempted": filled["fill_attempted"],
+                "fill_failed": filled["fill_failed"],
+                "fingerprint": filled["fingerprint"],
+            }
+            if filled.get("note"):
+                out["note"] = filled["note"]
+            elif not points:
+                out["note"] = ("no observations in this window and gap filling "
+                               "added none — a coverage gap, not a failure")
+            elif filled["gaps"]:
+                out["note"] = ("window is still incomplete: " + ", ".join(
+                    f"{g['start']}..{g['end']}" for g in filled["gaps"]
+                ) + " — results are partial, not a complete series")
+            elif truncated:
+                out["note"] = (f"window holds more than {MAX_SERIES_ROWS} points; returned the most "
+                               f"recent {MAX_SERIES_ROWS} — narrow the window for the rest")
+            if resolved:
+                scoping.record_hit(s, resolved["name"], len(points))
+            return out
+
+        truncated = len(rows) > MAX_SERIES_ROWS
+        kept = rows[-MAX_SERIES_ROWS:] if truncated else rows
+        points = [
+            {"date": r.date, "value": _coerce_value(r.value),
+             "unit": r.unit, "source_used": r.source_used}
+            for r in kept
+        ]
+        out = {
+            "concept_id": cid, "entity_type": entity_type, "entity_id": entity_id,
+            "start": start, "end": end, "count": len(points), "points": points,
+        }
+        if not points:
+            out["note"] = ("no cached observations in this window — a coverage gap, "
+                           "not a failure; no upstream fetch was attempted")
+        elif truncated:
+            out["note"] = (f"window holds more than {MAX_SERIES_ROWS} points; returned the most "
+                           f"recent {MAX_SERIES_ROWS} — narrow the window for the rest")
+        if resolved:
+            scoping.record_hit(s, resolved["name"], len(points))
+        return out
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("fetch"))
+def fetch(concept_id: int, entity_type: str, entity_id: int, date: str) -> dict:
+    """Force a fetch for one (concept, entity, date), bypassing cache freshness."""
+    from fd_open_data_mcp.refresh.runner import refresh_concept
+
+    s = _session()
+    try:
+        return refresh_concept(s, concept_id, entity_type, entity_id, date)
+    finally:
+        s.close()
+
+
+# ─── Crawl planning ─────────────────────────────────────────────────────────
+@mcp.tool(annotations=annotations_for("plan_crawl"))
+def plan_crawl(
+    concept_ids: list[int], entity_type: str,
+    start: str | None = None, end: str | None = None,
+    entity_ids: list[int] | None = None, frequency: str | None = None,
+    since_last: bool = False,
+    mode: str = "per_date",
+) -> dict:
+    """Plan a concept crawl -> CrawlPlan artifact (concepts in, methods out).
+
+    Compiles desired concepts + entity scope + date range into a ranked, failover-aware
+    CrawlPlan. Does not fetch. Unroutable concepts (no confirmed binding) and unmapped
+    entities (no per-source identifier) are reported, not silently dropped.
+
+    If ``since_last`` is True, the plan's ``date_range.start`` is derived from the minimum
+    per-concept ``max(date)`` already in ``semantic_observations`` (incremental crawl).
+    Either ``start`` or ``since_last`` must be provided. If both, ``start`` wins.
+    ``end`` defaults to today if not provided.
+
+    ``mode`` is ``per_date`` (one request per concept x entity x date) or ``series``
+    (one request per concept x entity against a bulk_history endpoint; the pipeline
+    explodes the returned frame). Series mode refuses concepts bound only to non-bulk
+    functions.
+    """
+    import datetime as dt
+    from fd_open_data_mcp.crawl.plan import DateRange, EntityScope
+    from fd_open_data_mcp.crawl.planner import plan_crawl as _plan
+
+    # Validation
+    if not start and not since_last:
+        raise ValueError("Either 'start' or 'since_last' must be provided")
+    if not end:
+        end = dt.date.today().isoformat()
+    if start and since_last:
+        since_last = False
+
+    s = _session()
+    try:
+        plan = _plan(
+            s, concept_ids,
+            EntityScope(entity_type=entity_type, entity_ids=entity_ids or None),
+            DateRange(start=start, end=end, frequency=frequency),
+            since_last=since_last, mode=mode,
+        )
+        return plan.model_dump(mode="json")
+    finally:
+        s.close()
+
+
+# ─── Scheduled refresh ──────────────────────────────────────────────────────
+@mcp.tool(annotations=annotations_for("generate_refresh_schedules"))
+def generate_refresh_schedules() -> dict:
+    """Generate cron schedules for concepts from their indicator_defs.frequency."""
+    from fd_open_data_mcp.refresh.scheduler import generate_schedules
+
+    s = _session()
+    try:
+        return generate_schedules(s)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("list_schedules"))
+def list_schedules() -> list[dict]:
+    """List all refresh schedules."""
+    from fd_open_data_mcp.refresh.scheduler import list_schedules as _list
+
+    s = _session()
+    try:
+        return _list(s)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("run_schedule"))
+def run_schedule(schedule_id: int) -> dict:
+    """Run one refresh schedule now (ranked-failover dispatch + execution record)."""
+    from fd_open_data_mcp.refresh.runner import run_schedule as _run
+
+    s = _session()
+    try:
+        return _run(s, schedule_id)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("list_cnreport_rules"))
+def list_cnreport_rules(
+    indicator: str | None = None, document_type: str | None = None,
+    module: str | None = None, kind: str | None = None, limit: int = 100,
+) -> dict:
+    """Browse cn-report's extraction rules (llm_rules + script_rules)."""
+    from fd_open_data_mcp.catalog.cnreport_rules import read_cnreport_rules
+
+    rules, errors = read_cnreport_rules(None, indicator, document_type, module, kind, limit)
+    return {"count": len(rules), "rules": rules, "errors": errors}
+
+
+@mcp.tool(annotations=annotations_for("enumerate_wbgapi_indicators"))
+def enumerate_wbgapi_indicators(database: str | None = None) -> dict:
+    """Enumerate all WDI indicators into columns + concepts + bindings (idempotent)."""
+    from fd_open_data_mcp.catalog.wbgapi_enumerate import enumerate_wbgapi_indicators as _enum
+
+    s = _session()
+    try:
+        return _enum(s, database)
+    finally:
+        s.close()
+
+
+@mcp.tool(annotations=annotations_for("register_discovered"))
+def register_discovered() -> dict:
+    """Auto-discover + register manifests from entry points + a datasources/ dir."""
+    from fd_open_data_mcp.catalog.register import discover_datasources
+
+    s = _session()
+    try:
+        results = discover_datasources(s)
+        return {"registered": results, "count": len(results)}
+    finally:
+        s.close()
+
+
+class BearerAuthMiddleware:
+    """ASGI middleware gating http requests behind a bearer token.
+
+    Active only when ``MCP_BEARER_TOKEN`` is set (read per-request): every
+    request must carry ``Authorization: Bearer <token>`` (constant-time
+    compare) or it is rejected with 401 before any MCP handling. stdio
+    never passes through here, and an unset/empty token disables the gate.
+    """
+
+    def __init__(self, asgi_app):
+        self.asgi_app = asgi_app
+
+    def __call__(self, scope, receive, send):
+        token = os.environ.get("MCP_BEARER_TOKEN", "").strip()
+        if scope["type"] != "http" or not token:
+            return self.asgi_app(scope, receive, send)
+
+        headers = dict(scope.get("headers") or [])
+        provided = headers.get(b"authorization", b"")
+        expected = ("Bearer " + token).encode("utf-8", "surrogateescape")
+        if hmac.compare_digest(provided, expected):
+            return self.asgi_app(scope, receive, send)
+
+        async def _reject(receive, send):
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"www-authenticate", b"Bearer"),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": b'{"error": "unauthorized"}'})
+
+        return _reject(receive, send)
+
+
+def _panel_app():
+    """The console panel ASGI app, or None when disabled/unavailable.
+
+    SERVE_PANEL=0 opts out (ships the MCP endpoint alone, as before).
+    """
+    if os.environ.get("SERVE_PANEL", "1") == "0":
+        return None
+    try:
+        from fd_open_data_mcp.panel.app import app as panel_app
+    except Exception:  # noqa: BLE001 - panel is optional at runtime
+        return None
+    return panel_app
+
+
+def _enable_mcp_session_reaping() -> None:
+    """Idle Streamable-HTTP sessions otherwise accumulate until the mcp SDK's
+    hard 10_000-session cap refuses every new session ("Refusing to open a new
+    session" — hit in production 2026-09-26). The SDK already reaps idle
+    sessions when ``session_idle_timeout`` is set, but fastmcp (3.4.x)
+    constructs the manager during lifespan startup and never forwards the
+    knob, so default it on the SDK constructor here. Override with
+    MCP_SESSION_IDLE_TIMEOUT (seconds); set it to 0 to disable.
+    """
+    try:
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    except Exception:  # noqa: BLE001 - http transport extras not installed
+        return
+    try:
+        timeout = float(os.environ.get("MCP_SESSION_IDLE_TIMEOUT", "1800") or 0)
+    except ValueError:
+        timeout = 1800.0
+    if timeout <= 0 or getattr(
+        StreamableHTTPSessionManager.__init__, "_fd_reaping_patch", False
+    ):
+        return
+    origin = StreamableHTTPSessionManager.__init__
+
+    def _init_with_idle_timeout(self, *args, **kwargs):
+        kwargs.setdefault("session_idle_timeout", timeout)
+        origin(self, *args, **kwargs)
+
+    _init_with_idle_timeout._fd_reaping_patch = True
+    StreamableHTTPSessionManager.__init__ = _init_with_idle_timeout
+
+
+def _http_asgi():
+    """Composite ASGI app: /panel/* -> console panel, /scopes|/indicators ->
+    scope REST face, everything else -> MCP.
+
+    Both apps carry their own auth (panel gate vs MCP bearer); one uvicorn
+    process serves both, so the console ships with zero extra deployments.
+    Websocket scopes under /panel (the login-station observation relay,
+    login-station-console 3.2) route to the panel too. The scope REST face
+    (scope-rest-api) is a plain request/response JSON surface — no session
+    semantics, so it never opens (or exhausts) MCP Streamable-HTTP sessions;
+    it carries its own SCOPE_API_TOKEN bearer gate and only http scopes are
+    forwarded (websockets fall through to MCP, as before). ``/mcp`` remains
+    the MCP endpoint — no prefix collision.
+    """
+    from starlette.middleware import Middleware
+
+    _enable_mcp_session_reaping()
+    token = os.environ.get("MCP_BEARER_TOKEN", "").strip()
+    if token:
+        mcp_asgi = mcp.http_app(middleware=[Middleware(BearerAuthMiddleware)])
+    else:
+        mcp_asgi = mcp.http_app()
+    panel_asgi = _panel_app()
+    try:
+        from fd_open_data_mcp.scope_rest import app as scope_rest_asgi
+    except Exception:  # noqa: BLE001 - REST face optional at runtime
+        scope_rest_asgi = None
+    if panel_asgi is None and scope_rest_asgi is None:
+        return mcp_asgi
+
+    async def composite(scope, receive, send):
+        if scope["type"] == "lifespan":
+            # A mounted sub-app's lifespan never fires, so this is the
+            # composite's top-level lifespan; the scope is forwarded to the
+            # MCP app's own lifespan handling. The panel's coverage-cache
+            # refresh loop is RETIRED here (add-data-stream-engine task 2.5):
+            # concept_coverage is maintained incrementally by the write hook.
+            try:
+                await mcp_asgi(scope, receive, send)
+            finally:
+                if task is not None:
+                    task.cancel()
+            return
+        if (panel_asgi is not None
+                and scope["type"] in ("http", "websocket")
+                and scope["path"].startswith("/panel")):
+            await panel_asgi(scope, receive, send)
+            return
+        # Scope REST face (scope-rest-api): /scopes + /indicators prefixes,
+        # http only — no MCP session opened, its own bearer gate applies.
+        if (scope["type"] == "http" and scope_rest_asgi is not None
+                and (scope["path"].startswith("/scopes")
+                     or scope["path"].startswith("/indicators"))):
+            await scope_rest_asgi(scope, receive, send)
+            return
+        await mcp_asgi(scope, receive, send)
+
+    return composite
+
+
+# ── cross-border merchant connector (内圈授权闸，add-crossborder-vertical-line 3.2) ──
+
+CROSSBORDER_PLATFORMS: dict[str, dict[str, str]] = {
+    "tiktok_shop": {"label": "TikTok Shop", "note": "first channel (2026-11 ruling)"},
+    "amazon": {"label": "Amazon SP-API", "note": "second channel, deferred"},
+    "temu": {"label": "Temu", "note": "catalog entity only"},
+    "shein": {"label": "SHEIN", "note": "catalog entity only"},
+}
+
+
+def _merchant_auth_registry() -> dict[str, dict]:
+    """Merchant grants from env; unset/invalid means nothing authorized yet."""
+    import json as _json
+    import os
+
+    raw = os.environ.get("FD_CROSSBORDER_MERCHANT_AUTH_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = _json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+@mcp.tool(annotations=annotations_for("crossborder_merchant_status"))
+def crossborder_merchant_status(platform: str = "tiktok_shop") -> dict:
+    """Report merchant-authorization status for a cross-border platform connector.
+
+    The inner-ring data channel (store operations, platform bestsellers,
+    after-sales reviews) is merchant-authorization-gated BY DESIGN: the
+    connector reads platform OFFICIAL APIs only, with the merchant's explicit
+    store authorization; scraping is out of contract (triage discipline:
+    never reverse-engineer). Until a merchant completes authorization the
+    tool answers with a structured ``unavailable (unauthorized)`` response —
+    never an error object and never a silent empty list, so agents can report
+    「不可得（未授权）」 verbatim.
+
+    Authorized deployments register merchant grants via the
+    ``FD_CROSSBORDER_MERCHANT_AUTH_JSON`` env ({"<platform>": {"authorized":
+    true, "merchant_id": "...", "scopes": [...]}}); the same response shape
+    then flips to ``authorized`` with the granted scopes.
+    """
+    key = (platform or "").strip().lower()
+    meta = CROSSBORDER_PLATFORMS.get(key)
+    if meta is None:
+        return {
+            "status": "unknown_platform",
+            "platform": platform,
+            "known_platforms": sorted(CROSSBORDER_PLATFORMS),
+        }
+    grant = _merchant_auth_registry().get(key) or {}
+    if grant.get("authorized") is True:
+        return {
+            "status": "authorized",
+            "platform": key,
+            "label": meta["label"],
+            "merchant_id": grant.get("merchant_id"),
+            "scopes": grant.get("scopes") or [],
+        }
+    return {
+        "status": "unavailable",
+        "reason": "unauthorized",
+        "platform": key,
+        "label": meta["label"],
+        "detail": "商家店铺授权前置（平台官方 API 通道，未授权不采集）——内圈数据不可得（未授权）",
+        "first_channel": key == "tiktok_shop",
+        "how_to_authorize": "店铺官方 API 授权凭据由部署方经 FD_CROSSBORDER_MERCHANT_AUTH_JSON 登记",
+    }
+
+
+def main(transport: str = "stdio", host: str = "127.0.0.1", port: int = 8300) -> None:
+    """Run the FastMCP server.
+
+    By default uses stdio transport (for local MCP clients launched as a
+    subprocess). Pass ``transport="http"`` to serve over Streamable HTTP
+    for long-running / remote use; the MCP endpoint is then reachable at
+    ``http://<host>:<port>/mcp``; the console panel is served alongside at
+    ``/panel`` unless SERVE_PANEL=0.
+
+    When ``MCP_BEARER_TOKEN`` is set, http requests must carry the matching
+    bearer token (401 otherwise); without it serving is unchanged.
+    """
+    if transport == "stdio":
+        mcp.run()
+        return
+
+    import uvicorn
+
+    uvicorn.run(_http_asgi(), host=host, port=port)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% from "_macros.html" import th, svg_grouped_bars %}
+{% block title %}{{ t('覆盖率') }} · {{ t('指标观察台') }}{% endblock %}
+{% block content %}
+<h2>{{ t('覆盖率') }}</h2>
+<p class="muted">{{ t('按源库与域的 registered / verified 统计；与 MCP 工具') }}
+<code>registry_coverage</code> {{ t('同库同 GROUP BY——同一时刻数字一致。') }}</p>
+{% include "_indicator_tabs.html" %}
+
+{% if not present %}
+<p class="muted">{{ t('注册目录表在本库不存在——无法统计。') }}</p>
+{% else %}
+{% if by_source %}
+<h3 class="mt">{{ t('按源库') }}</h3>
+{{ svg_grouped_bars(by_source.chart, label=t('按源库 registered 与 verified by source db')) }}
+<div class="table-wrap">
+<table>
+  <thead>
+  <tr>{{ th(t('源库')) }}{{ th(t('已登记')) }}{{ th(t('已验证')) }}{{ th(t('未验证')) }}{{ th(t('验证率')) }}</tr>
+  </thead>
+  {% for r in by_source.rows %}
+  <tr>
+    <td>{{ r.source_db }}</td>
+    <td>{{ r.registered }}</td>
+    <td>{{ r.verified }}</td>
+    <td>{{ r.unverified }}</td>
+    <td>{{ ((100 * r.verified / r.registered) | round(1)) if r.registered else '—' }}%</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+
+{% if by_domain %}
+<h3 class="mt">{{ t('按域') }}</h3>
+{{ svg_grouped_bars(by_domain.chart, label=t('按域 registered 与 verified by domain')) }}
+<div class="table-wrap">
+<table>
+  <thead>
+  <tr>{{ th(t('域')) }}{{ th(t('已登记')) }}{{ th(t('已验证')) }}{{ th(t('未验证')) }}{{ th(t('验证率')) }}</tr>
+  </thead>
+  {% for r in by_domain.rows %}
+  <tr>
+    <td>{{ r.domain or '—' }}</td>
+    <td>{{ r.registered }}</td>
+    <td>{{ r.verified }}</td>
+    <td>{{ r.unverified }}</td>
+    <td>{{ ((100 * r.verified / r.registered) | round(1)) if r.registered else '—' }}%</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+{% endif %}
+{% endblock %}

@@ -1,0 +1,51 @@
+{% from "_macros.html" import th %}
+<table>
+  <thead>
+  <tr>{{ th(t('发现')) }}{{ th(t('候选')) }}{{ th(t('已分析')) }}{{ th(t('已生成')) }}{{ th(t('待批准')) }}{{ th(t('已批准')) }}{{ th(t('已落地')) }}</tr>
+  </thead>
+  <tr>
+    <td>{{ f.counts.discoveries }}</td>
+    <td>{{ f.counts.candidates }}</td>
+    <td>{{ f.counts.analyses }}</td>
+    <td>{{ f.counts.generated }}</td>
+    <td>{{ f.counts.pending }}</td>
+    <td>{{ f.counts.approved }}</td>
+    <td>{% if f.counts.landed %}<span class="badge success">{{ f.counts.landed }}</span>{% else %}<span class="muted">0</span>{% endif %}</td>
+  </tr>
+</table>
+
+<h3>{{ t('最新待批准') }}</h3>
+<table>
+  <thead>
+  <tr>{{ th('ID') }}{{ th(t('源名')) }}{{ th(t('模型')) }}{{ th(t('更新')) }}</tr>
+  </thead>
+  {% for m in f.pending %}
+  <tr>
+    <td>{{ m.id }}</td>
+    <td>{{ m.source_name or '—' }}</td>
+    <td class="muted">{{ m.model_used or '—' }}</td>
+    <td class="muted">{{ m.updated_at or '—' }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="4" class="muted">{{ t('队列为空，没有待批准 manifest Empty queue — no draft manifests.') }}</td></tr>
+  {% endfor %}
+</table>
+
+<h3>{{ t('已批准') }}</h3>
+<p class="muted">{{ t('「已落地」= 源名精确匹配 crawl_sources（查询期判定，无外键）。"Landed" = source_name exactly matches a crawl_sources row (query-time fact, no FK).') }}</p>
+<table>
+  <thead>
+  <tr>{{ th('ID') }}{{ th(t('源名')) }}{{ th(t('模型')) }}{{ th(t('更新')) }}{{ th(t('状态')) }}</tr>
+  </thead>
+  {% for m in f.approved %}
+  <tr>
+    <td>{{ m.id }}</td>
+    <td>{% if m.landed and m.source_name %}<a href="/panel/sources/{{ m.source_name | urlencode }}">{{ m.source_name }}</a>{% else %}{{ m.source_name or '—' }}{% endif %}</td>
+    <td class="muted">{{ m.model_used or '—' }}</td>
+    <td class="muted">{{ m.updated_at or '—' }}</td>
+    <td>{% if m.landed %}<span class="badge success">{{ t('已落地 landed') }}</span>{% else %}<span class="badge">{{ t('已批准 approved') }}</span>{% endif %}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">{{ t('尚无已批准 manifest No approved manifests yet.') }}</td></tr>
+  {% endfor %}
+</table>

@@ -1,0 +1,21 @@
+{% from "_macros.html" import th %}
+<table>
+  <thead>
+  <tr>{{ th(t('运行'), 'Run') }}{{ th(t('策略'), 'Policy') }}{{ th(t('状态'), 'Status') }}{{ th(t('产出'), 'Yield') }}{{ th(t('完成于'), 'Finished') }}</tr>
+  </thead>
+  {% for r in runs %}
+  <tr>
+    <td>{% if perm >= 2 %}<a href="/panel/runs/{{ r.id }}">{% endif %}#{{ r.id }}{% if perm >= 2 %}</a>{% endif %}</td>
+    <td>{{ r.policy }}</td>
+    <td><span class="badge {{ r.status }}">{{ r.status }}</span></td>
+    <td>
+      {% if r.status == 'running' %}<span class="muted">—</span>
+      {% elif r.rows_new is none %}<span class="muted">{{ t('未上报') }}</span>
+      {% else %}{{ r.rows_new }} {{ t('新') }} / {{ r.rows_attempted or 0 }} {{ t('试') }}{% endif %}
+    </td>
+    <td class="muted">{{ fmt_ts(r.finished_at) or '—' }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">{{ t('还没有运行') }}</td></tr>
+  {% endfor %}
+</table>

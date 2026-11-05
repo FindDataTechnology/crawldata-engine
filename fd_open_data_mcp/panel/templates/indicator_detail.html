@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% from "_macros.html" import th %}
+{% block title %}{{ d.code }} · {{ t('指标详情') }}{% endblock %}
+{% block content %}
+<h2><code>{{ d.code }}</code> {{ d.name_zh or d.name_en or '' }}</h2>
+{% if d.name_en and d.name_zh %}<p class="en">{{ d.name_en }}</p>{% endif %}
+<p class="muted">{{ t('实体') }} {{ d.entity_type }} · {{ t('频率') }} {{ d.frequency }} ·
+{{ t('单位') }} {{ d.unit or '—' }} · {{ t('口径') }} {{ d.measure or '—' }} ·
+{% if d.verified %}<span class="badge success">verified</span>{% else %}<span class="badge unverified">unverified</span>{% endif %}
+{% if d.family_code %} · {{ t('族') }} <a href="/panel/indicators/families/{{ d.family_code }}"><code>{{ d.family_code }}</code></a>{% endif %}</p>
+<p><a href="/panel/indicators">← {{ t('返回登记表') }}</a> ·
+<a href="/panel/indicators/graph?indicator={{ d.id }}">{{ t('在关系图中打开') }} ↗</a></p>
+{% include "_indicator_tabs.html" %}
+
+{% if d.equivalences is not none %}
+<h3 class="mt">{{ t('跨源等价对') }}</h3>
+<p class="muted">{{ t('同一语义代码在各源库的锚点——合起来即该指标的跨源等价集。') }}</p>
+<div class="table-wrap">
+<table>
+  <thead>
+  <tr>{{ th(t('源库')) }}{{ th(t('原生代码')) }}{{ th(t('名称')) }}{{ th(t('状态')) }}</tr>
+  </thead>
+  {% for e in d.equivalences %}
+  <tr>
+    <td>{{ e.source_db }}</td>
+    <td><code>{{ e.source_table }}.{{ e.source_column }}#{{ e.native_code }}</code></td>
+    <td>{{ e.name_zh or e.name_en or '—' }}</td>
+    <td>{% if e.verified %}<span class="badge success">verified</span>{% else %}<span class="badge unverified">unverified</span>{% endif %}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="4" class="muted">{{ t('注册目录中无该语义代码的锚点') }}</td></tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+
+<h3 class="mt">{{ t('本地绑定') }}</h3>
+<div class="table-wrap">
+<table>
+  <thead>
+  <tr>{{ th(t('源')) }}{{ th(t('列（原生代码）')) }}{{ th(t('置信度')) }}{{ th(t('来源')) }}{{ th(t('复核')) }}</tr>
+  </thead>
+  {% for b in d.bindings %}
+  <tr>
+    <td>{{ b.source }}</td>
+    <td><code>{{ b.column }}</code></td>
+    <td>{{ '%.2f' | format(b.confidence) }}</td>
+    <td>{{ b.provenance }}</td>
+    <td>{{ '✓' if b.reviewed else '—' }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">{{ t('暂无绑定') }}</td></tr>
+  {% endfor %}
+</table>
+</div>
+
+<h3 class="mt">{{ t('词表映射') }}</h3>
+<div class="table-wrap">
+<table>
+  <thead>
+  <tr>{{ th(t('词表')) }}{{ th(t('词条')) }}{{ th(t('关系')) }}{{ th(t('置信度')) }}{{ th(t('来源')) }}</tr>
+  </thead>
+  {% for m in d.mappings %}
+  <tr>
+    <td>{{ m.vocabulary }}</td>
+    <td><code>{{ m.term }}</code></td>
+    <td>{{ m.relation }}</td>
+    <td>{{ '%.2f' | format(m.confidence) }}</td>
+    <td>{{ m.provenance }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">{{ t('暂无映射') }}</td></tr>
+  {% endfor %}
+</table>
+</div>
+{% endblock %}

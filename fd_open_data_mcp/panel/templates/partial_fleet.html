@@ -1,0 +1,10 @@
+{% from "_macros.html" import th %}
+<table>
+  <thead>
+  <tr>{{ th(t('集群'), 'Cluster') }}{{ th(t('并发 开/上限'), 'Open/Cap') }}{{ th(t('任务（实时）'), 'Jobs (live)') }}{{ th(t('可达'), 'Reachable') }}{{ th(t('出口'), 'Egress') }}{{ th(t('标签'), 'Tags') }}</tr>
+  </thead>
+  {% for f in fleet %}{% include "_fleet_row.html" %}{% else %}
+  <tr><td colspan="6" class="muted">{{ t('没有注册的集群') }}</td></tr>
+  {% endfor %}
+</table>
+<p class="muted">{{ t('done 星注') }}</p>

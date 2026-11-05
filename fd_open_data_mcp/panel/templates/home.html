@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}{{ t('总览') }} · {{ t('柏讯·寻新') }}{% endblock %}
+{% block content %}
+<h2>{{ t('现在与接下来') }}</h2>
+
+{% if scheduler_quiet %}
+<div class="banner warn">
+  ⚠ {{ t('调度器静默') }}: {{ t('调度器静默说明') }} {{ quiet_hours }}h
+  {% if last_run_started %}({{ t('上次') }}: {{ fmt_ts(last_run_started) }}){% else %}({{ t('从未记录过运行') }}){% endif %}
+  — {{ t('reconciler 可能已挂起或没有任何调度') }}.
+</div>
+{% endif %}
+
+{% from "_macros.html" import svg_bars %}
+<div class="kpi-row">
+  <div class="kpi"><div class="kpi-value">{{ kpi.running }}</div><div class="kpi-label">{{ t('运行中') }}</div></div>
+  <div class="kpi k-ok"><div class="kpi-value">{{ kpi.success_rate ~ '%' if kpi.success_rate is not none else '—' }}</div><div class="kpi-label">{{ t('24h 成功率') }}</div></div>
+  <div class="kpi"><div class="kpi-value">{{ "{:,}".format(kpi.new_rows) }}</div><div class="kpi-label">{{ t('24h 新增行') }}</div></div>
+  <div class="kpi k-err"><div class="kpi-value">{{ kpi.failures }}</div><div class="kpi-label">{{ t('24h 失败') }}</div></div>
+</div>
+
+<section class="card mt">
+  <h3>{{ t('产出趋势（近 14 天）') }}</h3>
+  {{ svg_bars(trend, t('近 14 天每日产出条形图')) }}
+</section>
+
+<div class="home-grid">
+  {# fleet health is an operate-tier surface (its partial requires perm >= 2):
+     viewers never see the block, so no polling request is ever issued -#}
+  {% if perm >= 2 %}
+  <section class="card">
+    <h3>{{ t('舰队') }}</h3>
+    <div hx-get="/panel/partials/fleet" hx-trigger="load, every {{ poll_seconds }}s [document.visibilityState === 'visible']">
+      <p class="muted">{{ t('加载中') }}…</p>
+    </div>
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <h3>{{ t('平台源健康') }}</h3>
+    <div hx-get="/panel/partials/platform" hx-trigger="load, every {{ poll_seconds }}s [document.visibilityState === 'visible']">
+      <p class="muted">{{ t('加载中') }}…</p>
+    </div>
+  </section>
+
+  <section class="card">
+    <h3>{{ t('运行中的爬取') }}</h3>
+    <div hx-get="/panel/partials/running" hx-trigger="load, every {{ poll_seconds }}s [document.visibilityState === 'visible']">
+      <p class="muted">{{ t('加载中') }}…</p>
+    </div>
+  </section>
+
+  <section class="card">
+    <h3>{{ t('接下来') }}</h3>
+    <div hx-get="/panel/partials/next" hx-trigger="load, every {{ poll_seconds }}s [document.visibilityState === 'visible']">
+      <p class="muted">{{ t('加载中') }}…</p>
+    </div>
+  </section>
+
+  <section class="card">
+    <h3>{{ t('最近完成') }}</h3>
+    <div hx-get="/panel/partials/recent" hx-trigger="load, every {{ poll_seconds }}s [document.visibilityState === 'visible']">
+      <p class="muted">{{ t('加载中') }}…</p>
+    </div>
+  </section>
+</div>
+
+<section class="card mt">
+  <h3>{{ t('错过的运行') }}</h3>
+  <div hx-get="/panel/partials/missed" hx-trigger="load, every {{ poll_seconds }}s [document.visibilityState === 'visible']">
+    <p class="muted">{{ t('加载中') }}…</p>
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,4 @@
+{{ t('预估') }}: <strong>{{ estimate }}</strong> {{ t('抓取') }}
+<span class="muted">({{ n_concepts }} {{ t('个概念') }}, {{ mode }} {{ t('模式') }}, {{ t('上限') }} {{ policy_max }})</span>
+{% if unroutable %}<br><span class="warn-text">{{ t('无法路由') }}: {{ unroutable|map(attribute='code')|join(', ') }}</span>{% endif %}
+{% if unmapped %}<br><span class="warn-text">{{ t('未映射实体') }}: {{ unmapped|length }}</span>{% endif %}

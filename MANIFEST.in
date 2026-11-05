@@ -1,0 +1,15 @@
+include .env.example
+# Direct-script policies (crawl_policies.executor='direct') read their script
+# source from the scraw image's /app/scripts; the scraw image extracts them
+# from THIS PROJECT's sdist (see scraw-fd-open-data-mcp Dockerfile), so the
+# sdist must carry the repo-level scripts/ dir — the wheel alone won't.
+recursive-include scripts *.py
+recursive-include fd_open_data_mcp/catalog/seeds *.json
+recursive-include fd_open_data_mcp/panel/templates *.html
+recursive-include fd_open_data_mcp/panel/static *
+# The alembic chain. The sdist must carry it because `python -m build` builds
+# the wheel *from the sdist*, and the wheel ships the revisions as package data
+# (the startup schema gate resolves them from there when no source checkout is
+# present — see setup.py).
+recursive-include alembic *.py *.sql *.mako
+include alembic.ini

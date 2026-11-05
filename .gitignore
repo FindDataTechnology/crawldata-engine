@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Environment variables (keep secrets private!)
+# NOTE: gitignore treats a trailing "# ..." as part of the pattern, so the
+# .env* patterns below must stay bare or they silently match nothing.
+.env
+.env.*
+!.env.example
+.env.local
+.env.localOverrides
+*.local.env
+
+# Database files
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+metadata/*.db
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Stray templating dirs
+{{pkgetc}}/
+
+# ferried HF hub cache for CI image builds (workflow fills it; .keep stays)
+hf-cache/*
+!hf-cache/.keep

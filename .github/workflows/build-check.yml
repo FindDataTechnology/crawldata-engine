@@ -1,0 +1,105 @@
+name: Build Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # add-data-stream-engine 6.4: the OSS sanitization gate. In THIS private repo
+  # the internal-host class is expected (deploy scripts legitimately reference
+  # the fleet), so the job reports rather than blocks. It becomes the blocking
+  # gate on the PUBLIC repo snapshot at 6.5, where the scrubbed tree must pass
+  # clean. CREDENTIAL hits must be fixed regardless of repo: treat anything that
+  # reached a commit as leaked and rotate it (SECURITY.md).
+  oss-sanitize:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run sanitization gate (report mode in private repo)
+        run: python scripts/oss_sanitize.py .
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Build package
+        run: python -m build
+
+      - name: Check distribution
+        run: twine check dist/*
+
+  # db-schema-lifecycle 4.5 + 6.5: catch model drift and vocabulary drift.
+  # 2026-09-16 incident root cause, other half: models changed with no
+  # revision ever noticing. `alembic check` compares the migrated empty
+  # database against Base.metadata — a model change without a matching
+  # revision fails here. The vocabulary step pins DB content naming to
+  # fd-open-data-protocol (design D8): every concepts.concept_code must
+  # resolve to a protocol concept family id.
+  schema:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # pgvector image: the vector migration (0004, semantic-search) runs
+        # CREATE EXTENSION vector — vanilla postgres:14 fails with "could not
+        # open extension control file vector.control" (6+ red runs through
+        # 2026-10-01).
+        image: pgvector/pgvector:pg14
+        env:
+          POSTGRES_USER: fdtest
+          POSTGRES_DB: fd_schema_ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fdtest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      FD_OPEN_DATA_MCP_DATABASE_URL: postgresql+psycopg2://fdtest@localhost:5432/fd_schema_ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+
+      # No out-of-band bootstrap: the chain itself creates registry_entries
+      # (0003's guarded section) and the control-plane family (0006) before
+      # anything references them — schema-drift-closure, 2026-10-01.
+
+      - name: Migrate empty database to head
+        run: alembic upgrade head
+
+      - name: Fail on model/revision drift (alembic check)
+        run: alembic check
+
+      - name: Vocabulary conformance (empty migrated DB must pass)
+        run: python scripts/check_vocabulary_conformance.py
+
+      - name: Vocabulary conformance tests
+        run: pytest tests/test_vocabulary_conformance.py -v

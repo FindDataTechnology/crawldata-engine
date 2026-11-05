@@ -1,0 +1,149 @@
+{#- Login-station observation MODAL (login-station-console 3.3, 2026-10-08
+    refactor). Previously this was a bare embedded frame at the top of the
+    page: the operator couldn't tell WHICH site/account they were logging
+    into, and a boot-window 502 page (>200 chars) fooled the auto-retry into
+    stopping, leaving a permanent "暂不可达". Now:
+      · a centered dialog that headlines the site display name + account;
+      · the readiness probe looks for noVNC's real DOM marker (not size);
+      · a 5s status poll flips the dialog to success/failed automatically.
+    The iframe points at the panel reverse proxy (panel-gated); noVNC connects
+    back through the relayed websockify path. -#}
+<div class="station-backdrop" id="station-modal-root">
+  <div class="station-modal">
+    <div class="station-head">
+      <div class="station-head-main">
+        <h3>{{ t('登录') }} · {{ st.source_label }}</h3>
+        <p class="station-sub">
+          {{ t('账号') }} <strong>{{ st.account_alias }}</strong>
+          {% if st.source_url %}· <a href="{{ st.source_url }}" target="_blank" rel="noopener">{{ st.source_url }}</a>{% endif %}
+          · {{ t('站') }} #{{ st.id }}
+          <span class="badge running" id="station-status-badge">{{ st.status }}</span>
+        </p>
+      </div>
+      <button type="button" class="link" onclick="this.closest('.station-backdrop').remove()">{{ t('关闭') }} ×</button>
+    </div>
+
+    <ol class="station-steps">
+      <li>{{ t('在下方画面中输入该站的账号密码（如遇滑块 / 验证码请一并完成）。') }}</li>
+      <li>{{ t('登录成功后本窗口自动提示并关闭，无需手动刷新。') }}</li>
+    </ol>
+
+    <div id="station-modal-body">
+    {% if st.live %}
+      <iframe id="station-frame" src="{{ vnc_url }}" title="login station {{ st.id }} observation view"
+              data-booting="1"></iframe>
+      <p class="muted" id="station-hint">{{ t('拉起中：站桌面约需 20-40 秒出现，会自动重试，无需手动刷新。') }}</p>
+    {% else %}
+      <p class="warn-text">{{ t('该站已结束') }}（{{ st.status }}）—— {{ t('观察通道已关闭。') }}</p>
+      {% if st.error %}<p class="warn-text wrap">{{ t('失败原因') }}: {{ st.error }}</p>{% endif %}
+      <form class="inline-form" hx-post="/panel/auth/station/launch" hx-target="#station-view" hx-swap="innerHTML">
+        <input type="hidden" name="source" value="{{ st.source }}">
+        <input type="hidden" name="account_alias" value="{{ st.account_alias }}">
+        {% if egresses %}
+        <select name="egress_ref" aria-label="{{ t('出口') }}" title="{{ t('重新拉起时使用的出口') }}">
+          <option value="">{{ t('出口：沿用当前') }}</option>
+          {% for e in egresses %}
+          <option value="{{ e.egress_ref }}">{{ e.label }}（{{ e.url_masked }}）</option>
+          {% endfor %}
+        </select>
+        {% endif %}
+        <button type="submit">{{ t('重新拉起登录站') }}</button>
+      </form>
+    {% endif %}
+    </div>
+  </div>
+</div>
+<script>
+(function () {
+  var root = document.getElementById('station-modal-root');
+  if (!root) return;
+  var frame = document.getElementById('station-frame');
+  var sid = {{ st.id }};
+  var tries = 0;
+
+  // Click on the dark backdrop (not the dialog) closes it
+  root.addEventListener('click', function (ev) {
+    if (ev.target === root) root.remove();
+  });
+
+  if (!frame) return;
+
+  // Boot readiness: only noVNC's real DOM marker counts. The previous probe
+  // (body length > 200) matched the friendly 502 page too, so the retry gave
+  // up on the first error page and the operator stared at it forever.
+  var timer = setInterval(function () {
+    tries += 1;
+    if (!document.getElementById('station-frame')) { clearInterval(timer); return; }
+    if (tries > 60) { clearInterval(timer); return; }
+    var ready = false;
+    try {
+      var doc = frame.contentDocument;
+      ready = !!(doc && (doc.getElementById('noVNC_screen')
+                         || doc.getElementById('noVNC_container')));
+    } catch (e) { ready = false; }
+    if (!ready) {
+      frame.src = frame.src.split('#')[0] + '#' + tries;  // re-request until booted
+    } else {
+      clearInterval(timer);
+      var hint = document.getElementById('station-hint');
+      if (hint) hint.textContent = {{ t('画面已就绪：请在上方完成登录。') | tojson }};
+    }
+  }, 3000);
+
+  // Status poll: launching/waiting_operator → keep waiting; completed →
+  // celebrate + auto-close; failed/timeout → show reason + relaunch.
+  var poll = setInterval(function () {
+    if (!document.getElementById('station-modal-root')) { clearInterval(poll); return; }
+    fetch('/panel/auth/station/' + sid + '/status').then(function (r) {
+      if (!r.ok) throw 0;
+      return r.json();
+    }).then(function (st) {
+      var badge = document.getElementById('station-status-badge');
+      if (badge && st.status) badge.textContent = st.status;
+      if (st.status === 'completed') {
+        clearInterval(poll); clearInterval(timer);
+        var body = document.getElementById('station-modal-body');
+        if (body) body.innerHTML =
+          '<p class="badge success">✔ ' + {{ t('登录成功') | tojson }} + '</p>' +
+          '<p class="muted">' + {{ t('身份 {s} / {a} 已激活，站点即将自动关闭。') | tojson }}.replace('{s}', st.source_label).replace('{a}', st.account_alias) + '</p>';
+        if (window.htmx) htmx.trigger('body', 'auth-refresh');
+        setTimeout(function () {
+          var m = document.getElementById('station-modal-root');
+          if (m) m.remove();
+        }, 5000);
+      } else if (st.status === 'failed' || st.status === 'timeout' || st.status === 'reclaimed') {
+        clearInterval(poll); clearInterval(timer);
+        var body2 = document.getElementById('station-modal-body');
+        if (body2) {
+          body2.textContent = '';
+          var p1 = document.createElement('p');
+          p1.className = 'warn-text';
+          p1.textContent = {{ t('登录站结束') | tojson }} + '（' + st.status + '）';
+          body2.appendChild(p1);
+          if (st.error) {
+            var p2 = document.createElement('p');
+            p2.className = 'warn-text wrap';
+            p2.textContent = {{ t('失败原因') | tojson }} + ': ' + st.error;   // textContent: never innerHTML
+            body2.appendChild(p2);
+          }
+          var f = document.createElement('form');
+          f.className = 'inline-form';
+          f.setAttribute('hx-post', '/panel/auth/station/launch');
+          f.setAttribute('hx-target', '#station-view');
+          f.setAttribute('hx-swap', 'innerHTML');
+          var h1 = document.createElement('input');
+          h1.type = 'hidden'; h1.name = 'source'; h1.value = st.source;
+          var h2 = document.createElement('input');
+          h2.type = 'hidden'; h2.name = 'account_alias'; h2.value = st.account_alias;
+          var b = document.createElement('button');
+          b.type = 'submit'; b.textContent = {{ t('重新拉起') | tojson }};
+          f.appendChild(h1); f.appendChild(h2); f.appendChild(b);
+          body2.appendChild(f);
+          if (window.htmx) htmx.process(f);
+        }
+        if (window.htmx) htmx.trigger('body', 'auth-refresh');
+      }
+    }).catch(function () {});
+  }, 5000);
+})();
+</script>

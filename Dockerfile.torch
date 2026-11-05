@@ -1,0 +1,83 @@
+# crawldata-engine search-capable image — slim variant + the MiniLM embedding
+# model baked in, served by fastembed/onnxruntime instead of torch
+# (openspec image-slimming; the file keeps its historical Dockerfile.torch
+# name). The k8s deployment sets HF_HUB_OFFLINE=1, so the model must be
+# present at build time, in the runtime user's (uid 1000) cache so the
+# default HF hub path resolves at runtime.
+# Built by .github/workflows/image.yml ->
+#   <REGISTRY>/finddata/crawldata-engine (tags sha-*/main)
+#
+# Package sources default to UPSTREAM (PyPI, huggingface.co) so non-CN runners
+# build at full speed (image-slimming: no CN mirrors in the default path, none
+# baked into the runtime image). CN builders opt in explicitly:
+#   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+#   --build-arg PIP_EXTRA_INDEX=https://mirrors.aliyun.com/pypi/simple/
+#   --build-arg HF_ENDPOINT=https://hf-mirror.com
+FROM python:3.12-slim
+
+ARG PIP_INDEX_URL=""
+ARG PIP_EXTRA_INDEX=""
+# hf-mirror by default: it works from both CN and CI runners, while
+# huggingface.co rate-limits anonymous requests from shared GitHub-runner
+# IP ranges (429 metadata errors). Override with --build-arg if needed.
+ARG HF_ENDPOINT="https://hf-mirror.com"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10
+
+WORKDIR /build
+COPY . .
+
+# fastembed serves the same MiniLM weights (sentence-transformers/
+# all-MiniLM-L6-v2) as official ONNX exports on onnxruntime (~15MB
+# compressed) where CPU torch needed ~195MB. Vector equivalence is gated by
+# openspec image-slimming reports/onnx-equivalence.md (cosine >0.999, same
+# 384 dims, cosine operator confirmed).
+RUN PIP_FLAGS=""; [ -n "$PIP_INDEX_URL" ] && PIP_FLAGS="-i $PIP_INDEX_URL"; \
+    EXTRA_FLAGS=""; [ -n "$PIP_EXTRA_INDEX" ] && EXTRA_FLAGS="--extra-index-url $PIP_EXTRA_INDEX"; \
+    pip install --no-cache-dir $PIP_FLAGS $EXTRA_FLAGS ".[search]"
+
+RUN useradd --create-home --uid 1000 appuser
+
+# MiniLM model, two ways in: CI ferries the qdrant/all-MiniLM-L6-v2-onnx
+# hub snapshot (fastembed's HF source). The bake materializes it as the
+# FLAT local-model layout fastembed checks first-class —
+# $FD_MCP_FASTEMBED_CACHE/fast-all-MiniLM-L6-v2/{model.onnx,...} — because
+# fastembed's HF-cache offline resolution proved unreliable in CI builds
+# (its cache-first branch fails silently while an explicit cache_dir
+# overrides HF_HOME). cp -rL dereferences the hub cache's blob symlinks.
+# An empty ferry (CN Jenkins context, hf-cache holds only .keep) falls
+# back to a build-time fastembed fetch via HF_ENDPOINT into the same dir.
+# The k8s deployment sets HF_HUB_OFFLINE=1 and resolves from the baked dir.
+COPY hf-cache/ /tmp/hf-ferry/
+ENV FD_MCP_FASTEMBED_CACHE=/home/appuser/.cache/fastembed-model
+RUN if [ -d /tmp/hf-ferry/hub/models--qdrant--all-MiniLM-L6-v2-onnx ]; then \
+        mkdir -p "$FD_MCP_FASTEMBED_CACHE/fast-all-MiniLM-L6-v2" && \
+        cp -rL /tmp/hf-ferry/hub/models--qdrant--all-MiniLM-L6-v2-onnx/snapshots/*/. \
+              "$FD_MCP_FASTEMBED_CACHE/fast-all-MiniLM-L6-v2/" && \
+        chown -R 1000:1000 /home/appuser/.cache; \
+    fi && rm -rf /tmp/hf-ferry
+
+USER appuser
+ENV HF_HOME=/home/appuser/.cache/huggingface
+RUN if [ -d "$FD_MCP_FASTEMBED_CACHE/fast-all-MiniLM-L6-v2" ] && [ -n "$(ls -A "$FD_MCP_FASTEMBED_CACHE/fast-all-MiniLM-L6-v2" 2>/dev/null)" ]; then \
+        HF_HUB_OFFLINE=1 python -c "from fd_open_data_mcp.embeddings.fastembed_backend import FastembedEncoder; FastembedEncoder('all-MiniLM-L6-v2')"; \
+    else \
+        if [ -n "$HF_ENDPOINT" ]; then export HF_ENDPOINT="$HF_ENDPOINT"; fi; \
+        python -c "from fd_open_data_mcp.embeddings.fastembed_backend import FastembedEncoder; FastembedEncoder('all-MiniLM-L6-v2')"; \
+    fi
+
+# Alembic migration chain, not part of the site-packages install; same
+# rationale as the plain Dockerfile — the deploy-time migration stage
+# (python -m fd_open_data_mcp.db.migrate_stage) resolves /app/alembic via
+# its cwd fallback (WORKDIR /app), override with FD_OPEN_DATA_MCP_ALEMBIC_DIR.
+# Last so chain edits don't invalidate the heavy model-cache layer.
+WORKDIR /app
+COPY alembic/ /app/alembic/
+COPY alembic.ini /app/alembic.ini
+
+EXPOSE 8899
+ENTRYPOINT ["crawldata-engine", "serve", "--transport", "http", "--host", "0.0.0.0", "--port", "8899"]

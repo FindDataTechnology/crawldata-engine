@@ -1,0 +1,21 @@
+# DISABLED (2026-09-10): image builds are DOMESTIC-ONLY.
+#
+# Policy: GitHub-hosted runners must NEVER push to the domestic Harbor
+# (private registries) or regional endpoints — foreign runner IPs hammering
+# domestic endpoints risk IP bans. Image builds now run on the fd-deploy box
+# (docker build from a Gitee/main checkout; see Dockerfile.torch +
+# ops-notes in the finddata workspace openspec) or on the private Jenkins
+# (private CI, dedicated job).
+#
+# This stub exists so the file path stays claimed and fails loudly if
+# anyone re-points it at a registry.
+name: docker-publish (disabled)
+on: workflow_dispatch
+jobs:
+  refuse:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse
+        run: |
+          echo "::error::Image builds are domestic-only (box/Jenkins). Do not re-enable pushes from GitHub runners."
+          exit 1

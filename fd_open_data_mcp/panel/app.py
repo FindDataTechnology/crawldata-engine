@@ -1,0 +1,2521 @@
+"""Panel routes: observability home + partials, run detail, data coverage,
+policy list + toggles, editor with estimate preview, runs view, proxy ops.
+
+Served standalone (``uvicorn fd_open_data_mcp.panel.app:app`` / CLI ``panel``)
+or mounted under /panel via ``mcp.http_app().mount``. All routes hit the same
+``crawl_policies``/``policy_runs`` tables as the MCP tools.
+"""
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import json
+import logging
+import os
+import urllib.parse
+import urllib.request
+from contextlib import asynccontextmanager
+from html import escape
+from pathlib import Path
+
+from fastapi import FastAPI, Form, HTTPException, Request, Response, WebSocket
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from sqlalchemy import func
+
+from fd_open_data_mcp import station_ops
+from fd_open_data_mcp.db import get_database
+from fd_open_data_mcp.models import (
+    BanRule, Cluster, Concept, CrawlLoginStation, CrawlPolicy, CrawlRun,
+    CrawlSite, CrawlSource, FetchLog, PendingRun, PolicyRun, Proxy,
+    SourceProxyHealth, SourceRateLimit,
+)
+from fd_open_data_mcp.panel.auth import (
+    PERM_ADMIN, PERM_OPERATE, PERM_VIEW, permission_level,
+)
+from fd_open_data_mcp.platform_tools import (
+    cancel_pending_run, cancel_platform_run, trigger_platform_run,
+)
+from fd_open_data_mcp.visibility import snapshot as _snapshot
+
+HERE = Path(__file__).parent
+
+
+class _PanelTemplates(Jinja2Templates):
+    """TemplateResponse that seeds every render with the request's permission
+    level and resolved locale (with its bound helpers) so templates gate
+    visibility and language in exactly one place (design D2/D4 — context
+    injection, not twin templates). Renders without a gate-decorated request
+    (no auth configured) default to the top tier and the default locale."""
+
+    def TemplateResponse(self, request, name, context=None, **kwargs):
+        from fd_open_data_mcp.panel import i18n
+        context = dict(context or {})
+        context.setdefault(
+            "perm", getattr(request.state, "panel_perm", PERM_ADMIN))
+        locale = getattr(request.state, "panel_locale", i18n.DEFAULT_LANG)
+        context.setdefault("locale", locale)
+        context.setdefault("t", lambda s: i18n.translate(s, locale))
+        context.setdefault("fmt_ts",
+                           lambda v: i18n.fmt_ts(v, locale))
+        context.setdefault("fmt_int",
+                           lambda n: i18n.fmt_int(n, locale))
+        context.setdefault("fmt_cron",
+                           lambda e: _fmt_cron(e, locale))
+        context.setdefault("lang_toggle_url",
+                           f"/panel/lang?to={'zh' if locale == 'en' else 'en'}")
+        return super().TemplateResponse(request, name, context, **kwargs)
+
+
+templates = _PanelTemplates(directory=str(HERE / "templates"))
+# Cache-busting fingerprint for static assets: static files ship no
+# cache-control header, so browsers heuristic-cache app.css across deploys and
+# new UI ships broken (seen 2026-10-08: station modal CSS missing → tiny
+# frame). Content hash changes on every deploy → URL changes → cache busts.
+import hashlib  # noqa: E402
+
+_css_bytes = (HERE / "static" / "app.css").read_bytes()
+templates.env.globals["css_v"] = hashlib.md5(_css_bytes).hexdigest()[:10]
+logger = logging.getLogger(__name__)
+
+FREQUENCIES = ["daily", "weekly", "monthly", "quarterly", "yearly"]
+MODES = ["series", "per_date"]
+DATE_POLICY_MODES = ["since_last", "trailing", "explicit"]
+
+# htmx poll cadence for the home partials (design D2) and the reconciler
+# liveness banner threshold (design: a suspended scheduler must be visible).
+POLL_SECONDS = 15
+RECONCILER_QUIET_HOURS = 24
+# census rows older than this show a staleness marker (add-shard-aware-coverage)
+CENSUS_STALE_HOURS = 24
+# coverage cache rows older than this show a staleness marker
+# (panel-data-coverage-cache design D7: hourly refresh × 6 consecutive
+# misses before the badge fires — anomaly signal, not noise)
+COVERAGE_STALE_HOURS = 6
+# RETIRED with the hourly refresh loop (task 2.5) — kept only so any stray
+# reference resolves; no scheduler reads it anymore.
+COVERAGE_REFRESH_MINUTE = 23
+
+# panel-ops-console 6.x: frequency-template proposals. The cron proposals and
+# the daily trailing-1d date policy are input aids only — the saved artifact is
+# an ordinary policy row (design D7).
+_TEMPLATE_CRON = {
+    "daily": "0 6 * * *", "weekly": "0 6 * * 1", "monthly": "0 6 1 * *",
+    "quarterly": "0 6 1 1,4,7,10 *", "yearly": "0 6 1 1 *",
+}
+
+# ── RBAC route table (panel-rbac-i18n-refresh design D1 / ADR-0002) ──────────
+_PUBLIC_PATHS = ("/panel/auth/login", "/panel/auth/callback",
+                 "/panel/auth/logout", "/panel/auth/whoami", "/panel/lang")
+
+
+def _required_perm(method: str, path: str) -> int | None:
+    """Minimum permission level for a concrete request; None = public.
+
+    Single source of truth for route RBAC. The coverage test walks app.routes
+    through this function so a new unmapped route fails CI instead of
+    silently defaulting. Unmapped /panel paths deny at admin (closed default).
+    """
+    if not path.startswith("/panel"):
+        return None  # "/" index redirect + non-panel mounts
+    if path in _PUBLIC_PATHS or path.startswith("/panel/static"):
+        return None
+    # admin — proxy ops, login-station console (incl. VNC relay targets),
+    # cluster capacity writes
+    if (path == "/panel/proxy" or path.startswith("/panel/proxy/")
+            or path == "/panel/partials/proxy"):
+        return PERM_ADMIN
+    if path == "/panel/auth" or path.startswith("/panel/auth/") \
+            or path == "/panel/partials/auth":
+        # everything under /panel/auth beyond the public OIDC quartet above
+        return PERM_ADMIN
+    if path.startswith("/panel/clusters/") and path.endswith("/capacity"):
+        return PERM_ADMIN
+    # operate — crawl actions and management writes
+    if (path.startswith("/panel/policies") or path == "/panel/estimate"
+            or path == "/panel/crawl/adhoc"):
+        return PERM_OPERATE
+    if path.startswith("/panel/sources"):
+        return PERM_OPERATE
+    if path.startswith("/panel/indicators/scopes"):
+        return PERM_OPERATE
+    if path == "/panel/runs" and method == "GET":
+        return PERM_VIEW  # runs list; detail pages/cancels below are operate
+    if path.startswith("/panel/runs") or path.startswith("/panel/pending"):
+        return PERM_OPERATE
+    if path == "/panel/partials/fleet":
+        return PERM_OPERATE  # cluster topology (spec: viewer home omits fleet)
+    if path.startswith("/panel/data/") and method == "POST":
+        return PERM_OPERATE  # coverage/census refreshes
+    # view — read-only data surfaces
+    if path in ("/panel", "/panel/data", "/panel/funnel", "/panel/denied"):
+        return PERM_VIEW
+    if path.startswith("/panel/partials/"):
+        return PERM_VIEW  # running/recent/next/missed/platform/funnel polls
+    if path.startswith("/panel/indicators"):
+        return PERM_VIEW  # observatory read views
+    return PERM_ADMIN  # closed default — extend the table, not this line
+
+
+def _fmt_cron(expr: str | None, locale: str) -> str | None:
+    """Cron → human-readable frequency + projected next fire (task 5.1);
+    falls back to the raw expression when the shape is unrecognized."""
+    from fd_open_data_mcp.panel import i18n
+    if not expr:
+        return None
+    human = i18n.cron_humanize(expr, locale)
+    nf = i18n.next_fire(expr)
+    head = human or expr
+    if nf is None:
+        return head
+    label = "下次" if locale == "zh" else "next"
+    return f"{head} · {label} {nf.strftime('%m-%d %H:%M')}"
+
+
+def _t(request: Request, s: str) -> str:
+    """Translate a static UI string with the request's locale (py-side twin
+    of the template ``t()`` — design D4)."""
+    from fd_open_data_mcp.panel import i18n
+    return i18n.translate(s, getattr(request.state, "panel_locale",
+                                     i18n.DEFAULT_LANG))
+
+
+def _msg(request: Request, zh: str, en: str, *args) -> str:
+    """Locale-aware dynamic message (toasts carry ids/names, so the plain
+    dict cannot key them): zh template or en template, ``str.format`` args."""
+    from fd_open_data_mcp.panel import i18n
+    locale = getattr(request.state, "panel_locale", i18n.DEFAULT_LANG)
+    tpl = en if locale == "en" else zh
+    return tpl.format(*args) if args else tpl
+
+
+def _audit(request: Request, action: str, target: str | None = None,
+           outcome: str = "success", reason: str | None = None) -> None:
+    """Persist one panel action-audit row; never blocks the audited action
+    (spec: audit failure must not break the operation)."""
+    try:
+        from fd_open_data_mcp.models import PanelActionAudit
+        session = getattr(request.state, "panel_user", None) or {}
+        sub = session.get("sub")
+        name = session.get("name")
+        if sub is None and name is None:
+            # token-authenticated calls carry no OIDC session (ADR-0003)
+            name = "token" if getattr(request.state, "panel_token", False) else None
+        row = PanelActionAudit(
+            actor_sub=sub, actor_name=name, route=request.url.path,
+            action=action, target=target, outcome=outcome, reason=reason)
+        s = _session()
+        try:
+            s.add(row)
+            s.commit()
+        finally:
+            s.close()
+    except Exception:  # noqa: BLE001 - audit is best-effort by contract
+        logger.warning("audit write failed for %s %s", action,
+                       request.url.path, exc_info=True)
+
+
+def _audit_login(claims: dict, action: str, reason: str | None = None) -> None:
+    """Audit a login outcome (success/rejected) straight from the id_token
+    claims — there is no session yet at callback time."""
+    try:
+        from fd_open_data_mcp.models import PanelActionAudit
+        row = PanelActionAudit(
+            actor_sub=claims.get("sub"), actor_name=claims.get("name"),
+            route="/panel/auth/callback", action=action, target=None,
+            outcome="success" if action == "login" else "failure",
+            reason=reason)
+        s = _session()
+        try:
+            s.add(row)
+            s.commit()
+        finally:
+            s.close()
+    except Exception:  # noqa: BLE001
+        logger.warning("login audit write failed", exc_info=True)
+
+
+def _template_concepts(s, frequency: str) -> list[Concept]:
+    """Hygiene-filtered concept pre-selection for a frequency template:
+    enabled concept cadence = the concept's own frequency; deprecated and
+    unverified concepts are excluded (spec crawl-control-center)."""
+    return (s.query(Concept)
+            .filter_by(frequency=frequency, deprecated=False, verified=True)
+            .order_by(Concept.code).all())
+
+
+def _session():
+    return get_database().get_session()
+
+
+def _policy_or_404(s, pid: int) -> CrawlPolicy:
+    p = s.query(CrawlPolicy).get(pid)
+    if not p:
+        raise HTTPException(404, f"policy {pid} not found")
+    return p
+
+
+def _entity_types(s) -> list[str]:
+    rows = s.query(CrawlPolicy.entity_type).distinct().all()
+    return [r[0] for r in rows]
+
+
+def _run_estimate(s, plan_json: dict | None) -> int:
+    from fd_open_data_mcp.crawl.plan import CrawlPlan
+    from fd_open_data_mcp.refresh.reconciler import estimate_fetches
+
+    if not plan_json:
+        return 0
+    try:
+        return estimate_fetches(s, CrawlPlan.model_validate(plan_json))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _concept_groups(s) -> list[tuple[str, list[Concept]]]:
+    """Concepts grouped by category for the editor multi-select."""
+    groups: dict[str, list[Concept]] = {}
+    for c in s.query(Concept).filter_by(deprecated=False).order_by(Concept.code).all():
+        cat = c.category or (c.code.split(".")[0] if "." in c.code else c.code)
+        groups.setdefault(cat, []).append(c)
+    return sorted(groups.items())
+
+
+def _parse_concept_ids(form_concepts: list[str]) -> list[int]:
+    return [int(x) for x in form_concepts if x]
+
+
+def _parse_entity_ids(raw: str) -> list[int] | None:
+    ids = [int(x) for x in raw.replace(" ", "").split(",") if x]
+    return ids or None  # empty -> all entities
+
+
+def _parse_source_filter(raw: str) -> list[str] | None:
+    vals = [x.strip() for x in raw.split(",") if x.strip()]
+    return vals or None
+
+
+def _parse_date_policy(
+    mode: str, days: str, start: str, end: str,
+) -> dict:
+    if mode == "trailing":
+        return {"mode": "trailing", "days": int(days) if days else 1}
+    if mode == "explicit":
+        return {"mode": "explicit", "start": start or None, "end": end or None}
+    return {"mode": "since_last"}
+
+
+# ── proxy operations (panel-ops-console) ─────────────────────────────────────
+def _mask_auth(auth: str | None) -> str:
+    """Mask a proxy credential for ANY panel rendering — the full value must
+    never appear in a panel response body (spec crawl-control-center)."""
+    if not auth:
+        return "—"
+    head = auth.split(":", 1)[0][:2]
+    return f"{head}•••••"
+
+
+def _proxy_control_ready() -> bool:
+    """Management actions need the proxy-control API; without it the proxy
+    pages degrade to read-only (design D1, ships-dark philosophy)."""
+    return bool(os.environ.get("PROXY_CONTROL_URL"))
+
+
+def _proxy_control(method: str, path: str, payload: dict | None = None) -> dict:
+    """POST/PUT a management action to the proxy-control API.
+
+    Raises RuntimeError on any transport/API failure; callers turn that into a
+    redirect-with-error rather than a 500."""
+    base = os.environ.get("PROXY_CONTROL_URL", "").rstrip("/")
+    if not base:
+        raise RuntimeError("PROXY_CONTROL_URL is not configured")
+    body = json.dumps(payload or {}).encode()
+    headers = {"Content-Type": "application/json"}
+    mgmt_token = os.environ.get("PROXY_CONTROL_TOKEN")
+    if mgmt_token:
+        headers["X-Management-Token"] = mgmt_token
+    req = urllib.request.Request(f"{base}{path}", data=body, method=method,
+                                 headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except Exception as e:  # noqa: BLE001 - normalized for the panel UX
+        raise RuntimeError(f"proxy-control {method} {path} failed: {e}") from e
+
+
+def _proxy_redirect(msg: str = "", err: str = "") -> RedirectResponse:
+    from urllib.parse import quote
+    q = f"?msg={quote(msg)}" if msg else (f"?err={quote(err)}" if err else "")
+    return RedirectResponse(f"/panel/proxy{q}", status_code=303)
+
+
+def _run_launcher():
+    """The reconciler's default launcher, resolved lazily (run cancel needs
+    its delete path; module-level so tests can stub it)."""
+    from fd_open_data_mcp.refresh.reconciler import _default_launcher
+    return _default_launcher()
+
+
+def _station_client():
+    """The station k8s client seam (module-level so tests stub it with a fake
+    — no station pod is ever really launched from tests)."""
+    return station_ops.get_station_client()
+
+
+# vnc proxy boot-window retries: a fresh station's Service exists ~20-40s
+# before Xvfb/websockify answer; the proxy waits it out server-side (tests
+# shrink these to stay fast).
+STATION_PROXY_ATTEMPTS = 6
+STATION_PROXY_RETRY_WAIT = 3.0
+
+
+def _station_upstream(station_id: int) -> str | None:
+    """``host:port`` of a live station's noVNC endpoint, or None when the
+    station is unknown / not in flight / its Service is not resolvable.
+    Applies the deadline-timeout backstop on read; module-level seam so tests
+    can point the proxy and the websocket relay at a local upstream."""
+    s = _session()
+    try:
+        station_ops.active_stations_summary(s)  # timeout backstop on read
+        st = s.get(CrawlLoginStation, station_id)
+        if st is None or st.status not in station_ops.STATION_OPEN:
+            return None
+        client = _station_client()
+        names = client.list_names("Service", f"station-id={station_id}")
+        if not names:
+            return None
+        return (f"{names[0]}.{client.namespace}.svc.cluster.local:"
+                f"{station_ops.STATION_PORT}")
+    except Exception:  # noqa: BLE001 - no resolvable station -> friendly error
+        return None
+    finally:
+        s.close()
+
+
+def _station_unavailable(station_id: int) -> str:
+    """Friendly (non-500) page for a station the proxy cannot serve.
+
+    States the row's own failure reason and offers a one-click relaunch: a
+    bare 'the channel is closed' left operators on a dead station with no
+    next step while the real error sat unread in the row's note."""
+    try:
+        s = _session()
+        try:
+            st = s.get(CrawlLoginStation, station_id)
+            reason = station_ops.station_error(st) if st is not None else None
+            source = st.source if st is not None else None
+            alias = st.account_alias if st is not None else None
+        finally:
+            s.close()
+    except Exception:  # noqa: BLE001 - a hint must never 500 the page
+        reason, source, alias = None, None, None
+    return (
+        "<h1>登录站不可用 login station unavailable</h1>"
+        f'<p>站 #{station_id} 已结束或已回收，观察通道已关闭。'
+        f"Station #{station_id} has finished or was reclaimed; the "
+        f"observation channel is closed.</p>"
+        + (f"<p class='warn-text'>失败原因 failure reason: "
+           f"{escape(reason[:300])}</p>" if reason else "")
+        + _relaunch_form(source, alias))
+
+
+def _relaunch_form(source: str | None, alias: str | None) -> str:
+    """One-click relaunch: reuse the identity's own source/alias, so a failed
+    station never has to be re-registered by hand."""
+    if not source or not alias:
+        return ""
+    return (f'<form class="inline-form" method="post" '
+            f'action="/panel/auth/station/launch">'
+            f'<input type="hidden" name="source" value="{escape(source)}">'
+            f'<input type="hidden" name="account_alias" value="{escape(alias)}">'
+            f'<button type="submit">重新拉起登录站 relaunch</button></form>')
+
+
+def _station_unreachable(station_id: int, err: Exception) -> str:
+    """Friendly 502 page: the station exists but its noVNC endpoint did not
+    answer (typically still booting)."""
+    return (
+        "<h1>登录站暂不可达 login station unreachable</h1>"
+        f'<p>站 #{station_id} 仍在拉起（约需数十秒），画面会自动出现；'
+        f"若持续失败请在下方重新拉起。Station #{station_id} is still booting "
+        f"— the frame fills in shortly; relaunch below if it keeps failing."
+        f"</p><p class='muted'>{type(err).__name__}</p>")
+
+
+# ── cockpit aggregations (panel-ui-refresh: KPI row + yield trend) ─────────
+def kpi_snapshot(s) -> dict:
+    """Home KPI row from `policy_runs`: running count, 24h terminal-run
+    success rate, 24h summed new rows, and 24h failures (failed +
+    zero_yield — the two operator-actionable terminal states)."""
+    now = dt.datetime.utcnow()
+    since = now - dt.timedelta(hours=24)
+    running = int(s.query(func.count(PolicyRun.id))
+                  .filter(PolicyRun.status == "running").scalar() or 0)
+    by_status: dict[str, int] = dict(
+        s.query(PolicyRun.status, func.count(PolicyRun.id))
+        .filter(PolicyRun.finished_at >= since,
+                PolicyRun.status != "running")
+        .group_by(PolicyRun.status).all())
+    terminal = sum(by_status.values())
+    successes = by_status.get("success", 0)
+    new_rows = int(s.query(func.coalesce(func.sum(PolicyRun.rows_new), 0))
+                   .filter(PolicyRun.finished_at >= since,
+                           PolicyRun.rows_new.isnot(None)).scalar() or 0)
+    return {
+        "running": running,
+        "success_rate": round(100 * successes / terminal) if terminal else None,
+        "new_rows": new_rows,
+        "failures": by_status.get("failed", 0) + by_status.get("zero_yield", 0),
+    }
+
+
+def yield_trend(s, days: int = 14) -> dict:
+    """Daily summed rows_new over the window, zero-filled, as bar geometry
+    (panel.charts) so the home template renders it directly."""
+    from fd_open_data_mcp.panel.charts import bar_geometry
+
+    now = dt.datetime.utcnow()
+    since = now - dt.timedelta(days=days - 1)
+    # func.date() returns a string on sqlite but a date on postgres —
+    # normalize keys to ISO strings so the zero-fill lookup always matches
+    rows = {
+        (k.isoformat() if hasattr(k, "isoformat") else str(k)): int(v or 0)
+        for k, v in s.query(func.date(PolicyRun.finished_at),
+                            func.sum(PolicyRun.rows_new))
+        .filter(PolicyRun.finished_at >= since,
+                PolicyRun.rows_new.isnot(None))
+        .group_by(func.date(PolicyRun.finished_at)).all()
+    }
+    labels, values = [], []
+    for i in range(days):
+        day = (since + dt.timedelta(days=i)).date()
+        labels.append(day.strftime("%m-%d"))
+        values.append(rows.get(day.isoformat(), 0))
+    return bar_geometry(values, labels=labels)
+
+
+def _policy_from_form(form) -> dict:
+    """Extract a policy payload dict from a submitted form."""
+    return {
+        "name": form.get("name", "").strip(),
+        "enabled": "enabled" in form,
+        "concept_ids": _parse_concept_ids(form.getlist("concept_ids")),
+        "entity_type": form["entity_type"],
+        "entity_ids": _parse_entity_ids(form.get("entity_ids", "")),
+        "date_policy": _parse_date_policy(
+            form.get("date_policy_mode", "since_last"),
+            form.get("date_policy_days", ""), form.get("date_policy_start", ""),
+            form.get("date_policy_end", "")),
+        "frequency": form.get("frequency", "daily"),
+        "mode": form.get("mode", "per_date"),
+        "source_filter": _parse_source_filter(form.get("source_filter", "")),
+        "force": "force" in form,
+        "cron_expr": form.get("cron_expr", "0 6 * * *"),
+        "timezone": form.get("timezone", "UTC"),
+    }
+
+
+async def _coverage_refresh_loop() -> None:
+    """RETIRED (add-data-stream-engine task 2.5): the hourly full-table
+    coverage refresh is replaced by the in-transaction write hook
+    (visibility.coverage.bump_rollups) — concept_coverage is maintained
+    incrementally at every observation write, so a periodic re-aggregation
+    over 6M+ rows (measured ~102 s at that size, scaling linearly) has
+    nothing left to do. Kept as a log-and-exit stub so old references stay
+    importable; the operator "refresh now" action maps to the exact rebuild
+    instead. Staleness badge: COVERAGE_STALE_HOURS now fires only if the
+    write hook stops running (anomaly signal)."""
+    logger.info("coverage refresh loop retired (incremental rollup hook active)")
+
+
+async def _prearm_loop() -> None:
+    """Background 预拉起 pre-arm pass (change prearm-login-station).
+
+    Every FD_PREARM_INTERVAL_SECONDS (default 300) the Console asks
+    ``station_ops.prearm_tick`` whether any scheduled authenticated source is
+    due soon with a stale/missing identity, and if so opens its login station —
+    so the operator finds the observation window already open instead of
+    discovering a dead session when the schedule fires (2026-10-09: the 03:10
+    rmfyalk run failed 'auth pool dry' while everyone slept).
+
+    Runs in the panel process because only the panel can reach the station
+    cluster (the station-launcher Role rides the fd-panel service account).
+    The panel runs single-replica (replicas=1), so no cross-instance dedupe is
+    needed: one loop, one pass, no lock. DB work runs in a worker thread; a
+    failing pass is logged and the loop continues — pre-arm is a convenience
+    over the manual launch path, never a reason to take the panel down.
+    """
+    if os.environ.get("FD_PREARM_ENABLED", "1").strip() == "0":
+        logger.info("prearm: disabled by FD_PREARM_ENABLED=0")
+        return
+    interval = station_ops.prearm_interval_seconds()
+    logger.info("prearm: loop started (every %ds)", interval)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            def _run() -> list[dict]:
+                s = _session()
+                try:
+                    return station_ops.prearm_tick(s, client=_station_client())
+                finally:
+                    s.close()
+            launched = await asyncio.to_thread(_run)
+            if launched:
+                logger.info(
+                    "prearm: launched %d station(s): %s", len(launched),
+                    ", ".join(f"{x.get('source')}/{x.get('account_alias')}"
+                              f"#{x.get('station_id')}" for x in launched))
+            else:
+                logger.info("prearm: no station needed this pass")
+        except Exception:
+            logger.exception("prearm: pass failed; continuing")
+
+
+def create_app() -> FastAPI:
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        tasks = [asyncio.get_running_loop().create_task(
+            _coverage_refresh_loop())]
+        # Tests must never start the pre-arm loop (it would reach for a
+        # cluster and a real database on every TestClient startup).
+        if (os.environ.get("FD_PREARM_DISABLE_TESTS") == "1"
+                or "PYTEST_CURRENT_TEST" in os.environ):
+            logger.info("prearm: loop not started (test environment)")
+        else:
+            tasks.append(asyncio.get_running_loop().create_task(_prearm_loop()))
+        yield
+        for task in tasks:
+            task.cancel()
+
+    app = FastAPI(title="Crawl Control Center", lifespan=_lifespan)
+    app.mount("/panel/static", StaticFiles(directory=str(HERE / "static")),
+              name="panel_static")
+
+    # ── auth gate + RBAC (panel-logto-auth D3, panel-rbac-i18n-refresh D1) ─
+    # Precedence: PANEL_TOKEN (programmatic, admin-equivalent per ADR-0003)
+    # → OIDC session cookie (tiered role admission) → redirect to Logto
+    # login (when LOGTO_* configured) → legacy 401. The OIDC routes
+    # themselves and static assets are always public; every OTHER /panel/auth
+    # path — the login-station observation channel and the identity writes
+    # (login-station-console 3.2: 观察通道不裸奔) — goes through this same gate
+    # and additionally requires the admin tier.
+    token = os.environ.get("PANEL_TOKEN")
+    from fd_open_data_mcp.panel import auth as _auth
+
+    @app.middleware("http")
+    async def gate(request: Request, call_next):
+        from fd_open_data_mcp.panel import i18n
+        cfg = _auth.logto_config()
+        path = request.url.path
+        # locale rides every request (design D4): cookie > Accept-Language > zh
+        request.state.panel_locale = i18n.resolve_locale(
+            request.cookies.get(i18n.LANG_COOKIE),
+            request.headers.get("accept-language"))
+        if path in _PUBLIC_PATHS or path.startswith("/panel/static"):
+            return await call_next(request)
+        required = _required_perm(request.method, path)
+        if token:
+            # query/header only — a browser-held panel_token cookie defeated
+            # both interactive paths (never redirected to Logto; logout could
+            # not log out), so the cookie variant is not admitted or set
+            if (request.query_params.get("token") == token
+                    or request.headers.get("X-Panel-Token") == token):
+                request.state.panel_token = True
+                request.state.panel_perm = PERM_ADMIN
+                return await call_next(request)
+        session = _auth.read_session(request.cookies.get(_auth.SESSION_COOKIE))
+        if session is not None:
+            # Tiered admission (design D1): roles frozen into the session at
+            # login decide both admission (any Scout role) and the permission
+            # level; removals in Logto propagate at next login, not
+            # mid-session. No roles claim at login → fail closed (callback).
+            level = permission_level(session["roles"])
+            if cfg is not None and level == 0:
+                # PANEL_USER_IDS fallback (panel-role-gate): allow-listed subs
+                # keep legacy operator admission while roles are being rolled
+                # out; everyone else fails closed.
+                allowed = _auth.allow_list()
+                if not (allowed is not None and session["sub"] in allowed):
+                    return HTMLResponse(
+                        "<h1>403 - no Scout role granted</h1>", status_code=403)
+                level = PERM_OPERATE
+            request.state.panel_user = session
+            request.state.panel_perm = level
+            if required is not None and level < required:
+                if request.method == "GET" and "text/html" in (
+                        request.headers.get("accept") or ""):
+                    return RedirectResponse(
+                        f"/panel/denied?to={urllib.parse.quote(path)}",
+                        status_code=302)
+                return HTMLResponse(
+                    "<h1>403 - insufficient role for this action</h1>",
+                    status_code=403)
+            return await call_next(request)
+        if cfg is not None:
+            return RedirectResponse("/panel/auth/login", status_code=302)
+        if token is not None:
+            return HTMLResponse("<h1>401 - set PANEL_TOKEN / ?token=</h1>",
+                                status_code=401)
+        # no gate configured — open panel, no RBAC differentiation (ships-dark)
+        request.state.panel_perm = PERM_ADMIN
+        return await call_next(request)
+
+    # ── OIDC routes (panel-logto-auth) ─────────────────────────────────────
+    @app.get("/panel/lang")
+    def lang_toggle(to: str = "", back: str = "/panel"):
+        """Language switch (design D4): GET + cookie, deliberately not a POST
+        (keeps the WAF surface unchanged); `back` only accepts in-app paths."""
+        from fd_open_data_mcp.panel import i18n
+        if to not in i18n.LANGUAGES:
+            to = i18n.DEFAULT_LANG
+        if not back.startswith(("/panel", "/")) or back.startswith("//"):
+            back = "/panel"
+        resp = RedirectResponse(back, status_code=303)
+        resp.set_cookie(i18n.LANG_COOKIE, to, max_age=365 * 86400,
+                        samesite="lax", httponly=True)
+        return resp
+
+    @app.get("/panel/auth/login")
+    def auth_login():
+        cfg = _auth.logto_config()
+        if cfg is None:
+            return HTMLResponse("<h1>401 - Logto not configured</h1>", status_code=401)
+        state, cookie_value = _auth.make_state()
+        resp = RedirectResponse(_auth.authorize_url(cfg, state), status_code=302)
+        resp.set_cookie(_auth.STATE_COOKIE, cookie_value, httponly=True,
+                        samesite="lax", max_age=600)
+        return resp
+
+    @app.get("/panel/auth/callback")
+    def auth_callback(request: Request, code: str = "", state: str = "",
+                      error: str = "", error_description: str = ""):
+        cfg = _auth.logto_config()
+        if cfg is None:
+            return HTMLResponse("<h1>401 - Logto not configured</h1>", status_code=401)
+        if error:
+            return HTMLResponse(
+                f"<h1>login failed</h1><p>{error}: {error_description}</p>",
+                status_code=401)
+        if not _auth.check_state(request.cookies.get(_auth.STATE_COOKIE), state):
+            return HTMLResponse("<h1>401 - bad state</h1>", status_code=401)
+        try:
+            token_response = _auth.exchange_code(cfg, code)
+            claims = _auth.id_token_claims(cfg, token_response)
+        except Exception as e:  # noqa: BLE001 - provider/network errors
+            return HTMLResponse(f"<h1>login failed</h1><p>{e}</p>", status_code=401)
+        # Tiered admission (panel-rbac-i18n-refresh): extract roles first —
+        # the Scout-role set decides admission AND the permission level the
+        # session carries. PANEL_USER_IDS stays the legacy fallback: a
+        # allow-listed sub keeps admission even without a roles claim;
+        # everyone else without a Scout role fails closed.
+        extracted = _auth.extract_roles(cfg, claims, token_response)
+        roles: list[str] = extracted or []
+        if permission_level(roles) == 0:
+            allowed = _auth.allow_list()
+            if allowed is not None and claims.get("sub") in allowed:
+                roles = []  # legacy allow-listed operator: level applied at gate
+            elif extracted is None:
+                _audit_login(claims, "rejected", "no roles claim in token")
+                return HTMLResponse("<h1>403 - no roles claim in token</h1>",
+                                    status_code=403)
+            else:
+                _audit_login(claims, "rejected", "no Scout role granted")
+                return HTMLResponse(
+                    "<h1>403 - no Scout role granted</h1>", status_code=403)
+        _audit_login(claims, "login")
+        resp = RedirectResponse("/panel", status_code=302)
+        resp.set_cookie(_auth.SESSION_COOKIE,
+                        _auth.make_session_value(
+                            claims.get("sub", ""),
+                            # a null `name` claim would otherwise freeze the
+                            # literal "None" into the cookie payload (sidebar
+                            # showed "None" — fixed panel-rbac-i18n-refresh 6.2)
+                            claims.get("name") or "", roles),
+                        httponly=True, samesite="lax",
+                        max_age=_auth.SESSION_HOURS * 3600)
+        resp.delete_cookie(_auth.STATE_COOKIE)
+        return resp
+
+    @app.get("/panel/auth/logout")
+    def auth_logout():
+        # RP-initiated logout when Logto is configured: the IdP session must
+        # end too, or the next /panel hit silently re-authenticates through
+        # the still-alive SSO cookie (authorize has no prompt=login) and the
+        # user never actually logs out.
+        cfg = _auth.logto_config()
+        target = (_auth.end_session_url(cfg)
+                  if cfg else "/panel")
+        resp = RedirectResponse(target, status_code=302)
+        resp.delete_cookie(_auth.SESSION_COOKIE)
+        resp.delete_cookie("panel_token")  # clear pre-role-gate browsers
+        return resp
+
+    @app.get("/panel/auth/whoami", response_class=HTMLResponse)
+    def auth_whoami(request: Request):
+        session = getattr(request.state, "panel_user", None) or _auth.read_session(
+            request.cookies.get(_auth.SESSION_COOKIE))
+        if session is None:
+            return HTMLResponse("")
+        return HTMLResponse(
+            f'<span>{session["name"]}</span> '
+            f'<a href="/panel/auth/logout" class="btn">{_t(request, "退出")}</a>')
+
+    # ── pages ──────────────────────────────────────────────────────────────
+    @app.get("/", response_class=HTMLResponse)
+    def index():
+        return RedirectResponse("/panel")
+
+    @app.get("/panel/denied", response_class=HTMLResponse)
+    def denied(request: Request, to: str = ""):
+        """Explanatory landing for permission-blocked page GETs (spec:
+        interactive pages redirect here instead of dead-ending on 403)."""
+        return templates.TemplateResponse(
+            request, "denied.html", {"to": to}, status_code=403)
+
+    def _unavailable(e: Exception) -> HTMLResponse:
+        # One failing partial must not fail the page (spec: live panel refresh)
+        return HTMLResponse(f'<p class="muted">分区暂不可用 section unavailable: {e}</p>')
+
+    def _scheduler_quiet(s) -> tuple[bool, str | None]:
+        """True when no run has started within RECONCILER_QUIET_HOURS — the
+        suspended-reconciler case stays visible instead of silent."""
+        last = s.query(func.max(PolicyRun.started_at)).scalar()
+        if last is None:
+            return True, None
+        # TIMESTAMP WITHOUT TIME ZONE column, naive-UTC per the writer contract
+        age_h = (dt.datetime.utcnow() - last).total_seconds() / 3600
+        return age_h > RECONCILER_QUIET_HOURS, last.isoformat()
+
+    @app.get("/panel", response_class=HTMLResponse)
+    def home(request: Request):
+        s = _session()
+        try:
+            quiet, last_started = _scheduler_quiet(s)
+            return templates.TemplateResponse(
+                request, "home.html",
+                {"poll_seconds": POLL_SECONDS,
+                 "quiet_hours": RECONCILER_QUIET_HOURS,
+                 "scheduler_quiet": quiet, "last_run_started": last_started,
+                 "kpi": kpi_snapshot(s), "trend": yield_trend(s)})
+        finally:
+            s.close()
+
+    # ── home partials (htmx polling; each degrades independently) ──────────
+    @app.get("/panel/partials/running", response_class=HTMLResponse)
+    def partial_running(request: Request):
+        try:
+            s = _session()
+            try:
+                rows = _snapshot.running_runs(s)
+            finally:
+                s.close()
+            return templates.TemplateResponse(
+                request, "partial_running.html", {"runs": rows})
+        except Exception as e:  # noqa: BLE001
+            return _unavailable(e)
+
+    @app.get("/panel/partials/recent", response_class=HTMLResponse)
+    def partial_recent(request: Request):
+        try:
+            s = _session()
+            try:
+                rows = _snapshot.recent_runs(s, limit=15)
+            finally:
+                s.close()
+            return templates.TemplateResponse(
+                request, "partial_recent.html", {"runs": rows})
+        except Exception as e:  # noqa: BLE001
+            return _unavailable(e)
+
+    @app.get("/panel/partials/fleet", response_class=HTMLResponse)
+    def partial_fleet(request: Request):
+        try:
+            s = _session()
+            try:
+                rows = _snapshot.fleet_health(s)
+            finally:
+                s.close()
+            return templates.TemplateResponse(
+                request, "partial_fleet.html", {"fleet": rows})
+        except Exception as e:  # noqa: BLE001
+            return _unavailable(e)
+
+    @app.get("/panel/partials/next", response_class=HTMLResponse)
+    def partial_next(request: Request):
+        try:
+            s = _session()
+            try:
+                rows = _snapshot.next_runs(s)
+            finally:
+                s.close()
+            return templates.TemplateResponse(
+                request, "partial_next.html", {"upcoming": rows})
+        except Exception as e:  # noqa: BLE001
+            return _unavailable(e)
+
+    @app.get("/panel/partials/missed", response_class=HTMLResponse)
+    def partial_missed(request: Request):
+        """Missed-run board (panel-ops-console): enabled policies whose latest
+        expected fire passed the grace interval with no successful run."""
+        try:
+            s = _session()
+            try:
+                rows = _snapshot.missed_runs(s)
+            finally:
+                s.close()
+            return templates.TemplateResponse(
+                request, "partial_missed.html", {"missed": rows})
+        except Exception as e:  # noqa: BLE001
+            return _unavailable(e)
+
+    # ── run detail ─────────────────────────────────────────────────────────
+    @app.get("/panel/runs/{run_id}", response_class=HTMLResponse)
+    def run_detail(request: Request, run_id: int):
+        s = _session()
+        try:
+            row = (
+                s.query(PolicyRun, CrawlPolicy.name, Cluster.name)
+                .join(CrawlPolicy, PolicyRun.policy_id == CrawlPolicy.id)
+                .outerjoin(Cluster, PolicyRun.cluster_id == Cluster.id)
+                .filter(PolicyRun.id == run_id)
+                .first()
+            )
+            if not row:
+                raise HTTPException(404, f"run {run_id} not found")
+            run, policy_name, cluster_name = row
+
+            plan = run.plan_json if isinstance(run.plan_json, dict) else {}
+            concepts = [
+                {"id": pc.get("concept_id"), "code": pc.get("code"),
+                 "sources": [rs.get("source") for rs in pc.get("ranked_sources") or []]}
+                for pc in plan.get("wanted_concepts") or []
+            ]
+            scope = plan.get("entity_scope") or {}
+            date_range = plan.get("date_range") or {}
+
+            # fetch_log carries no run key (design D5): approximate by the run's
+            # window filtered to its plan concepts + cluster, labeled as such.
+            from collections import Counter
+
+            from fd_open_data_mcp.panel.charts import (
+                timeline_buckets, timeline_geometry)
+
+            fetch_summary: list[dict] = []
+            fetch_timeline = None
+            window_end = run.finished_at or dt.datetime.utcnow()
+            if run.started_at:
+                concept_ids = [c["id"] for c in concepts if c["id"] is not None]
+                fq = (
+                    s.query(FetchLog.timestamp, FetchLog.status)
+                    .filter(FetchLog.timestamp >= run.started_at,
+                            FetchLog.timestamp <= window_end,
+                            FetchLog.cluster_id == run.cluster_id)
+                )
+                if concept_ids:
+                    fq = fq.filter(FetchLog.concept_id.in_(concept_ids))
+                rows = fq.all()
+                samples = [(t, status == "ok") for t, status in rows]
+                fetch_summary = [
+                    {"status": status, "count": int(cnt)}
+                    for status, cnt in Counter(st for _, st in rows).items()
+                ]
+                fetch_timeline = timeline_geometry(timeline_buckets(samples))
+            return templates.TemplateResponse(
+                request, "run_detail.html",
+                {"run": run.toDict(), "policy_name": policy_name,
+                 "cluster_name": cluster_name,
+                 "plan": {"mode": plan.get("mode"),
+                          "concepts": concepts,
+                          "entity_type": scope.get("entity_type"),
+                          "entity_ids": scope.get("entity_ids"),
+                          "start": date_range.get("start"),
+                          "end": date_range.get("end")},
+                 "fetch_summary": fetch_summary,
+                 "fetch_timeline": fetch_timeline,
+                 "fetch_window": [run.started_at.isoformat() if run.started_at else None,
+                                  run.finished_at.isoformat() if run.finished_at else "now"],
+                 "duration_min": (int(((run.finished_at or dt.datetime.utcnow())
+                                       - run.started_at).total_seconds() // 60)
+                                 if run.started_at else None)})
+        finally:
+            s.close()
+
+    # ── data coverage ──────────────────────────────────────────────────────
+    def _census_rows(s) -> list[dict]:
+        """Stored census rows + staleness flags; never collects (design D3)."""
+        from fd_open_data_mcp.visibility.census import latest_census
+
+        out = []
+        now = dt.datetime.utcnow()
+        for r in latest_census(s):
+            sampled = r.get("sampled_at")
+            age_h = None
+            if sampled:
+                t = dt.datetime.fromisoformat(sampled)
+                if t.tzinfo is not None:
+                    t = t.replace(tzinfo=None)
+                age_h = (now - t).total_seconds() / 3600
+            r["age_hours"] = round(age_h, 1) if age_h is not None else None
+            r["stale"] = age_h is None or age_h > CENSUS_STALE_HOURS
+            out.append(r)
+        return out
+
+    @app.get("/panel/data", response_class=HTMLResponse)
+    def data_coverage(request: Request, concept_id: str = "",
+                      entity_type: str = "", freshness: str = ""):
+        try:
+            cid: int | None = int(concept_id) if concept_id else None
+        except ValueError:
+            cid = None
+        from fd_open_data_mcp.panel.charts import (
+            freshness_bucket, freshness_days, heatmap_tiles)
+        from fd_open_data_mcp.visibility.coverage import (
+            cached_concept_coverage, coverage_by_concept)
+
+        s = _session()
+        try:
+            # heatmap counts come from the unfiltered universe, served from
+            # the coverage cache; one live pass only while the cache is empty
+            # (first-boot bounded fallback, design D5). never-observed
+            # concepts appear in no observation row, so count them from Concept
+            cached = cached_concept_coverage(s)
+            universe_rows = cached["concepts"] or coverage_by_concept(s)
+            coverage_live = not cached["concepts"]
+            universe = (s.query(Concept)
+                        .filter_by(deprecated=False).count())
+            counts: dict[str, int] = {}
+            for r in universe_rows:
+                key = freshness_bucket(freshness_days(r["latest_date"]))
+                counts[key] = counts.get(key, 0) + 1
+            counts["never"] = max(
+                0, universe - len({r["concept_id"] for r in universe_rows}))
+            heat = heatmap_tiles(counts)
+
+            # filtered listings are sub-second live (point-column group-by
+            # under the uq index prefix); unfiltered listings read the cache
+            if cid or entity_type:
+                rows = coverage_by_concept(s, concept_id=cid,
+                                           entity_type=entity_type or None)
+                coverage_live = True
+            else:
+                rows = universe_rows
+            if freshness:
+                rows = [r for r in rows
+                        if freshness_bucket(freshness_days(r["latest_date"])) == freshness]
+            total_rows = sum(r["rows"] for r in rows)
+            census_rows = _census_rows(s)
+            return templates.TemplateResponse(
+                request, "data.html",
+                {"coverage": rows, "total_rows": total_rows,
+                 "n_concepts": len(rows),
+                 "census": census_rows,
+                 "census_total": sum(r.get("approx_rows") or 0 for r in census_rows),
+                 "concept_id": cid, "entity_type": entity_type,
+                 "freshness": freshness, "heat": heat,
+                 "coverage_age_hours": cached["age_hours"],
+                 "coverage_stale": (cached["age_hours"] is not None
+                                    and cached["age_hours"] > COVERAGE_STALE_HOURS),
+                 "coverage_live": coverage_live})
+        finally:
+            s.close()
+
+    @app.get("/panel/stream", response_class=HTMLResponse)
+    def stream_board(request: Request):
+        """Stream-plane observability (add-data-stream-engine task 5.3): three
+        metric groups, all read-only — stream health (3.6), storage watermark
+        (2.7), and the execution-model distribution (leasing vs job runs)."""
+        import os as _os
+        from sqlalchemy import func as _func
+        from fd_open_data_mcp.visibility.coverage import storage_watermark
+        from fd_open_data_mcp.models import PolicyRun as _PR
+
+        # stream health: only when a Redis stream is configured (degrade to a
+        # notice otherwise — the board still shows watermark + distribution)
+        health = None
+        if _os.environ.get("REDIS_URL"):
+            try:
+                import redis as _redis
+                from fd_open_data_mcp.stream.redis_streams import RedisStreamsSink
+                from fd_open_data_mcp.stream.health import stream_health
+                _r = _redis.Redis.from_url(_os.environ["REDIS_URL"],
+                                           decode_responses=True)
+                sink = RedisStreamsSink(_r)
+                group = _os.environ.get("FD_ODM_INGEST_GROUP", "ingest")
+                health = stream_health(sink, group)
+            except Exception as e:  # noqa: BLE001 - health is best-effort chrome
+                health = {"error": str(e)}
+
+        s = _session()
+        try:
+            watermark = storage_watermark(s)
+            # execution distribution: lease: runs vs job runs among recent runs
+            recent = s.query(_PR).order_by(_PR.id.desc()).limit(200).all()
+            leasing = sum(1 for r in recent if (r.job_ref or "").startswith("lease:"))
+            jobs = len(recent) - leasing
+            return templates.TemplateResponse(
+                request, "stream.html",
+                {"health": health, "watermark": watermark,
+                 "leasing_runs": leasing, "job_runs": jobs,
+                 "recent_total": len(recent)})
+        finally:
+            s.close()
+
+    @app.post("/panel/data/coverage/refresh")
+    def data_coverage_refresh(request: Request):
+        from fd_open_data_mcp.visibility.coverage import rebuild_concept_rollups
+
+        s = _session()
+        try:
+            out = rebuild_concept_rollups(s)
+        finally:
+            s.close()
+        logger.info("manual coverage refresh: %s", out)
+        _audit(request, "coverage_refresh", target="concepts",
+               outcome="success")
+        return RedirectResponse("/panel/data", status_code=303)
+
+    @app.post("/panel/data/census/refresh")
+    def data_census_refresh(request: Request):
+        from fd_open_data_mcp.visibility.census import refresh_census
+
+        s = _session()
+        try:
+            refresh_census(s)
+        finally:
+            s.close()
+        _audit(request, "census_refresh", target="census", outcome="success")
+        return RedirectResponse("/panel/data", status_code=303)
+
+    @app.get("/panel/policies", response_class=HTMLResponse)
+    def policy_list(request: Request, q: str = "", page: int = 1):
+        # server-side pagination + search (panel-policies-search-pagination):
+        # the catalog hit 2,485 rows and one giant table froze the browser
+        PAGE_SIZE = 50
+        page = max(1, page)
+        s = _session()
+        try:
+            from sqlalchemy import or_
+
+            base = s.query(CrawlPolicy)
+            term = q.strip()
+            if term:
+                like = f"%{term}%"
+                filters = [CrawlPolicy.name.ilike(like),
+                           CrawlPolicy.entity_type.ilike(like)]
+                if term.isdigit():
+                    filters.append(CrawlPolicy.id == int(term))
+                base = base.filter(or_(*filters))
+            filtered = base.count()
+            total = s.query(CrawlPolicy).count()
+            policies = (base.order_by(CrawlPolicy.id)
+                        .limit(PAGE_SIZE).offset((page - 1) * PAGE_SIZE).all())
+            pages = max(1, -(-filtered // PAGE_SIZE))
+            return templates.TemplateResponse(
+                request, "policies.html",
+                {"policies": [p.toDict() for p in policies],
+                 "entity_types": _entity_types(s),
+                 "q": term, "page": page, "pages": pages,
+                 "filtered": filtered, "total": total,
+                 "page_size": PAGE_SIZE})
+        finally:
+            s.close()
+
+    def _run_row_dict(s, r: PolicyRun, policies: dict) -> dict:
+        d = {"id": r.id, "policy": policies.get(r.policy_id, f"#{r.policy_id}"),
+             "policy_id": r.policy_id, "origin": r.origin,
+             "status": r.status, "job_ref": r.job_ref,
+             "started_at": r.started_at.isoformat() if r.started_at else None,
+             "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+             "detail": r.detail}
+        d["estimate"] = _run_estimate(s, r.plan_json)
+        return d
+
+    def _toast(resp, message: str, level: str = "ok"):
+        # Inline actions announce outcomes via HX-Trigger; app.js renders the toast.
+        resp.headers["HX-Trigger"] = json.dumps(
+            {"toast": {"message": message, "level": level}})
+        return resp
+
+    def _run_row_response(request: Request, s, run_id: int):
+        r = s.query(PolicyRun).get(run_id)
+        if r is None:
+            return None
+        policies = {p.id: p.name for p in s.query(CrawlPolicy).all()}
+        return templates.TemplateResponse(
+            request, "_run_row.html",
+            {"r": _run_row_dict(s, r, policies), "policies": policies})
+
+    @app.get("/panel/runs", response_class=HTMLResponse)
+    def runs(request: Request, status: str = "", policy_id: str = ""):
+        # `policy_id` arrives as a string because the filter form/chips submit
+        # the select even when empty ("all policies"); "" means no filter
+        try:
+            pid: int | None = int(policy_id) if policy_id else None
+        except ValueError:
+            pid = None
+        s = _session()
+        try:
+            q = s.query(PolicyRun)
+            if status:
+                q = q.filter_by(status=status)
+            if pid is not None:
+                q = q.filter_by(policy_id=pid)
+            runs_rows = q.order_by(PolicyRun.started_at.desc()).limit(200).all()
+            policies = {p.id: p.name for p in s.query(CrawlPolicy).all()}
+            rendered = [_run_row_dict(s, r, policies) for r in runs_rows]
+            # crawl-platform: platform runs (crawl_runs) shown side by side
+            # with policy_runs — the policy columns above stay untouched.
+            platform = _snapshot.platform_runs(s, limit=50)
+            ctx = {"runs": rendered, "status": status, "policies": policies,
+                   "platform_runs": platform}
+            # status chips / policy filter swap just the results region
+            if request.headers.get("hx-request") == "true":
+                return templates.TemplateResponse(
+                    request, "partial_runs_results.html", ctx)
+            return templates.TemplateResponse(request, "runs.html", ctx)
+        finally:
+            s.close()
+
+    # ── run control (panel-ops-console) ─────────────────────────────────────
+    @app.post("/panel/runs/{run_id}/cancel")
+    def run_cancel(run_id: int, request: Request):
+        """Cancel an open run: CAS row close + best-effort Job deletion.
+        HTMX requests get the re-rendered row + toast; plain posts redirect."""
+        from fd_open_data_mcp.refresh.runs import cancel_run
+
+        hx = request.headers.get("hx-request") == "true"
+        s = _session()
+        try:
+            try:
+                out = cancel_run(s, run_id, actor="panel",
+                                 launcher=_run_launcher())
+            except HTTPException:
+                raise
+            _audit(request, "run_cancel", target=str(run_id),
+                   outcome="success" if out["status"] == "cancelled" else "failure",
+                   reason=str(out.get("current_status") or out["status"]))
+            if hx:
+                if out["status"] == "cancelled":
+                    row = _run_row_response(request, s, run_id)
+                    return _toast(row, _msg(request, "运行 #{} 已取消", "Run {} cancelled", run_id))
+                if out["status"] == "not_found":
+                    return _toast(HTMLResponse(""), f"run {run_id} not found", "err")
+                return _toast(_run_row_response(request, s, run_id),
+                              _msg(request, "运行 #{} 已结束，未取消（{}）",
+                                   "Run {} already finished ({})", run_id,
+                                   out.get('current_status')), "err")
+        finally:
+            s.close()
+        if out["status"] == "cancelled":
+            return RedirectResponse("/panel/runs", status_code=303)
+        if out["status"] == "not_found":
+            raise HTTPException(404, f"run {run_id} not found")
+        raise HTTPException(409, f"run {run_id} already finished "
+                                 f"({out.get('current_status')}); nothing cancelled")
+
+    @app.post("/panel/clusters/{cluster_id}/capacity")
+    async def cluster_capacity(cluster_id: int, request: Request):
+        """Edit a cluster's max-concurrent-open-runs; effective next tick."""
+        form = await request.form()
+        hx = request.headers.get("hx-request") == "true"
+        try:
+            value = int(form.get("capacity", ""))
+        except (TypeError, ValueError):
+            if hx:
+                return _toast(HTMLResponse("", status_code=400),
+                              _t(request, "capacity 必须是整数"), "err")
+            raise HTTPException(400, "capacity must be an integer")
+        if value < 0:
+            if hx:
+                return _toast(HTMLResponse("", status_code=400),
+                              _t(request, "capacity 必须 >= 0"), "err")
+            raise HTTPException(400, "capacity must be >= 0")
+        s = _session()
+        try:
+            c = s.get(Cluster, cluster_id)
+            if c is None:
+                if hx:
+                    return _toast(HTMLResponse(""),
+                                  f"cluster {cluster_id} not found", "err")
+                raise HTTPException(404, f"cluster {cluster_id} not found")
+            c.capacity = value
+            s.commit()
+            _audit(request, "cluster_capacity", target=str(cluster_id),
+                   outcome="success", reason=f"capacity={value}")
+            if hx:
+                row = next((f for f in _snapshot.fleet_health(s)
+                            if f["id"] == cluster_id), None)
+                resp = (templates.TemplateResponse(request, "_fleet_row.html",
+                                                   {"f": row}) if row
+                        else HTMLResponse(""))
+                return _toast(resp, _msg(request, "{} 容量已保存：{}", "{} capacity saved: {}", c.name, value))
+        finally:
+            s.close()
+        return RedirectResponse("/panel", status_code=303)
+
+    # ── platform sources & control (crawl-platform 4.1/4.2) ──────────────────
+    # Same tables as the platform_* MCP tools (crawl_sources / crawl_runs /
+    # pending_runs); the write operations are the shared functions from
+    # platform_tools so the two entrances enforce identical guardrails.
+    PLATFORM_HEALTH_FILTERS = ("stalled", "lit", "unlit")
+
+    def _source_row_response(request: Request, s, source: str):
+        row = next((r for r in _snapshot.platform_sources(s)
+                    if r["source"] == source), None)
+        if row is None:
+            return None
+        return templates.TemplateResponse(
+            request, "_source_row.html", {"s": row})
+
+    def _platform_run_row_response(request: Request, s, run_id: int):
+        row = next((r for r in _snapshot.platform_runs(s, limit=500)
+                    if r["id"] == run_id), None)
+        if row is None:
+            return None
+        return templates.TemplateResponse(
+            request, "_platform_run_row.html", {"r": row})
+
+    def _pending_row_response(request: Request, s, pending_id: int):
+        p = s.get(PendingRun, pending_id)
+        if p is None:
+            return None
+        return templates.TemplateResponse(
+            request, "_pending_row.html", {"p": p.toDict()})
+
+    @app.get("/panel/sources", response_class=HTMLResponse)
+    def platform_sources_page(request: Request, site: str = "",
+                              health: str = ""):
+        """Platform source inventory: every crawl_sources row with site,
+        schedule (未点亮 when NULL), enabled, latest crawl_runs fact, active
+        pending count, trigger button. Filters: site / health state."""
+        s = _session()
+        try:
+            rows = _snapshot.platform_sources(s, site=site or None)
+            if health == "stalled":
+                rows = [r for r in rows if r["stalled"]]
+            elif health == "lit":
+                rows = [r for r in rows if r["schedule"]]
+            elif health == "unlit":
+                rows = [r for r in rows if not r["schedule"]]
+            sites = [r[0] for r in s.query(CrawlSite.id).order_by(CrawlSite.id).all()]
+            ctx = {"sources": rows, "site": site, "health": health,
+                   "sites": sites}
+            # health chips / site filter swap just the results region
+            if request.headers.get("hx-request") == "true":
+                return templates.TemplateResponse(
+                    request, "partial_sources_results.html", ctx)
+            return templates.TemplateResponse(request, "sources.html", ctx)
+        finally:
+            s.close()
+
+    @app.get("/panel/sources/{source}", response_class=HTMLResponse)
+    def platform_source_detail(request: Request, source: str):
+        s = _session()
+        try:
+            src = s.get(CrawlSource, source)
+            if src is None:
+                raise HTTPException(404, f"source {source} not found")
+            row = next((r for r in _snapshot.platform_sources(s)
+                        if r["source"] == source), None)
+            runs = _snapshot.platform_runs(s, source=source, limit=20)
+            pending = [
+                p.toDict() for p in (
+                    s.query(PendingRun)
+                    .filter(PendingRun.source == source,
+                            PendingRun.status.in_(("pending", "claimed")))
+                    .order_by(PendingRun.id.desc()).all())
+            ]
+            # discovery-pipeline provenance (query-time fact, no FK): the
+            # latest approved manifest whose source_name equals this source
+            pipeline = _snapshot.source_pipeline_link(s, source)
+            return templates.TemplateResponse(
+                request, "source_detail.html",
+                {"src": src.toDict(), "health": row,
+                 "runs": runs, "pending": pending, "pipeline": pipeline})
+        finally:
+            s.close()
+
+    @app.post("/panel/sources/{source}/trigger")
+    def platform_source_trigger(source: str, request: Request):
+        """Queue an immediate run: insert pending_runs (requested_by='panel').
+        Validation is the shared platform_tools.trigger_platform_run —
+        unregistered / disabled / single-flight refusals carry clear text."""
+        hx = request.headers.get("hx-request") == "true"
+        s = _session()
+        try:
+            out = trigger_platform_run(s, source, requested_by="panel")
+            _audit(request, "source_trigger", target=source,
+                   outcome="success" if out["status"] == "triggered" else "failure",
+                   reason=str(out.get("reason") or out.get("pending_id")))
+            if out["status"] == "triggered":
+                msg = _msg(request, "{} 已触发：pending #{}（site {}）",
+                           "{} queued: pending #{} (site {})", source,
+                           out['pending_id'], out.get('site') or '—')
+                if hx:
+                    return _toast(_source_row_response(request, s, source), msg)
+                return RedirectResponse(f"/panel/sources/{source}",
+                                        status_code=303)
+            msg = _msg(request, "{} 未触发：{}", "{} not triggered: {}",
+                       source, out['reason'])
+            if out["status"] == "not_found":
+                if hx:
+                    return _toast(HTMLResponse(""), msg, "err")
+                raise HTTPException(404, out["reason"])
+            # refused (disabled / single-flight) or a rejected insert
+            if hx:
+                return _toast(_source_row_response(request, s, source) or
+                              HTMLResponse(""), msg, "err")
+            if out["status"] == "error":
+                raise HTTPException(400, out["reason"])
+            raise HTTPException(409, out["reason"])
+        finally:
+            s.close()
+
+    @app.post("/panel/runs/platform/{run_id}/cancel")
+    def platform_run_cancel(run_id: int, request: Request):
+        """Request cancellation of a RUNNING platform run: CAS-set
+        cancel_requested; the runner closes its own row as cancelled."""
+        hx = request.headers.get("hx-request") == "true"
+        s = _session()
+        try:
+            out = cancel_platform_run(s, run_id)
+            _audit(request, "platform_run_cancel", target=str(run_id),
+                   outcome="success" if out["status"] == "cancel_requested" else "failure",
+                   reason=str(out.get("current_status") or out["status"]))
+            if hx:
+                if out["status"] == "cancel_requested":
+                    return _toast(
+                        _platform_run_row_response(request, s, run_id),
+                        _msg(request, "平台运行 #{} 已请求取消——运行器将在下个检查点退出",
+                             "Platform run {} cancel requested — the runner exits "
+                             "at its next checkpoint", run_id))
+                if out["status"] == "not_found":
+                    return _toast(HTMLResponse(""),
+                                  f"platform run {run_id} not found", "err")
+                return _toast(
+                    _platform_run_row_response(request, s, run_id)
+                    or HTMLResponse(""),
+                    _msg(request, "运行 #{} 已结束，未取消（{}）",
+                         "Run {} already finished ({})", run_id,
+                         out.get('current_status')), "err")
+        finally:
+            s.close()
+        if out["status"] == "cancel_requested":
+            return RedirectResponse("/panel/runs", status_code=303)
+        if out["status"] == "not_found":
+            raise HTTPException(404, f"platform run {run_id} not found")
+        raise HTTPException(409, f"platform run {run_id} already finished "
+                                 f"({out.get('current_status')}); nothing cancelled")
+
+    @app.post("/panel/pending/{pending_id}/cancel")
+    def platform_pending_cancel(pending_id: int, request: Request):
+        """Cancel a pending/claimed pending_runs row (CAS; terminal rows 409)."""
+        hx = request.headers.get("hx-request") == "true"
+        s = _session()
+        try:
+            back = None
+            p = s.get(PendingRun, pending_id)
+            if p is not None:
+                back = f"/panel/sources/{p.source}"
+            out = cancel_pending_run(s, pending_id)
+            _audit(request, "pending_cancel", target=str(pending_id),
+                   outcome="success" if out["status"] == "cancelled" else "failure",
+                   reason=str(out.get("current_status") or out["status"]))
+            if hx:
+                if out["status"] == "cancelled":
+                    return _toast(
+                        _pending_row_response(request, s, pending_id),
+                        _msg(request, "待运行务 #{} 已取消", "Pending {} cancelled",
+                             pending_id))
+                if out["status"] == "not_found":
+                    return _toast(HTMLResponse(""),
+                                  f"pending run {pending_id} not found", "err")
+                return _toast(
+                    _pending_row_response(request, s, pending_id)
+                    or HTMLResponse(""),
+                    _msg(request, "待运行务 #{} 已是终态，未取消（{}）",
+                         "Pending {} already {} — nothing cancelled", pending_id,
+                         out.get('current_status')), "err")
+        finally:
+            s.close()
+        if out["status"] == "cancelled":
+            return RedirectResponse(back or "/panel/sources", status_code=303)
+        if out["status"] == "not_found":
+            raise HTTPException(404, f"pending run {pending_id} not found")
+        raise HTTPException(409, f"pending run {pending_id} already "
+                                 f"{out.get('current_status')}; nothing cancelled")
+
+    @app.get("/panel/partials/platform", response_class=HTMLResponse)
+    def partial_platform(request: Request):
+        """Polled platform-source health roll-up on the cockpit (15s, degrades
+        independently like every home partial)."""
+        try:
+            s = _session()
+            try:
+                h = _snapshot.platform_health(s)
+            finally:
+                s.close()
+            return templates.TemplateResponse(
+                request, "partial_platform.html", {"h": h})
+        except Exception as e:  # noqa: BLE001
+            return _unavailable(e)
+
+    # ── source-discovery funnel (harness-platform-integration 2.2/2.3) ──────
+    # Read-only view over the central pipeline tables (discoveries /
+    # candidates / analyses / manifests). The page shell never touches the
+    # DB; the polled partial carries the data and degrades independently.
+    # Approval happens on the harness tool surface (agent-operated) — the
+    # panel only observes the funnel (spec source-discovery-pipeline).
+    @app.get("/panel/funnel", response_class=HTMLResponse)
+    def funnel_page(request: Request):
+        return templates.TemplateResponse(
+            request, "funnel.html", {"poll_seconds": POLL_SECONDS})
+
+    @app.get("/panel/partials/funnel", response_class=HTMLResponse)
+    def partial_funnel(request: Request):
+        """Polled funnel stage counts + latest approval queue (15s, degrades
+        like every home partial)."""
+        try:
+            s = _session()
+            try:
+                f = _snapshot.discovery_funnel(s)
+            finally:
+                s.close()
+            return templates.TemplateResponse(
+                request, "partial_funnel.html", {"f": f})
+        except Exception as e:  # noqa: BLE001
+            return _unavailable(e)
+
+    # ── authenticated-crawling panel (session-pool 4.1) ─────────────────────
+    # The Console login操作面 (login-station-console 3.3): the identity x
+    # health matrix with one-click login-station launch, the login-required
+    # queue, the event stream, multi-account registration and the station
+    # board. The page shell carries the standing alert summary (it must be
+    # visible on the first paint) and nothing else; the polled partial carries
+    # the data and degrades independently. Logins happen ON the login station —
+    # this surface orchestrates and observes (spec authenticated-crawling).
+    @app.get("/panel/auth", response_class=HTMLResponse)
+    def auth_page(request: Request):
+        """The auth console shell. The alert summary is computed here too so a
+        standing banner is visible the moment the page paints (the polled
+        partial then owns it inside the same swap region); a database hiccup
+        degrades to no banner, never a 500 shell."""
+        try:
+            s = _session()
+            try:
+                auth_alert = station_ops.auth_alert_summary(s)
+            finally:
+                s.close()
+        except Exception as e:  # noqa: BLE001 - the shell must still render
+            logger.warning("auth page: alert summary unavailable: %s", e)
+            auth_alert = None
+        return templates.TemplateResponse(
+            request, "auth.html",
+            {"poll_seconds": POLL_SECONDS, "auth_alert": auth_alert})
+
+    @app.get("/panel/partials/auth", response_class=HTMLResponse)
+    def partial_auth(request: Request):
+        """Polled auth panel: identity matrix grouped by source, the
+        login-required queue and the latest identity events (15s, degrades
+        like every home partial); login-station board + registration sources
+        ride along (login-station-console 3.3). The standing alert banner
+        (prearm-login-station: 需登录 / 会话可能已过期) rides at the top."""
+        try:
+            s = _session()
+            try:
+                pool = _snapshot.identity_pool(s)
+                queue = _snapshot.login_queue(s)
+                events = _snapshot.identity_events(s, limit=20)
+                profiles = dict(
+                    s.query(CrawlSource.source, CrawlSource.auth_profile).all())
+                stations = station_ops.station_status(s, limit=10)
+                egresses = station_ops.selectable_egresses(s)
+                auth_alert = station_ops.auth_alert_summary(s)
+                station_sources = [
+                    {"source": r.source, "auth_profile": r.auth_profile}
+                    for r in (s.query(CrawlSource)
+                              .filter(CrawlSource.auth_profile.isnot(None))
+                              .order_by(CrawlSource.source).all())
+                    if r.auth_profile]
+            finally:
+                s.close()
+            grouped: dict[str, list[dict]] = {}
+            for r in pool:
+                grouped.setdefault(r["source"], []).append(r)
+            groups = [{"source": src,
+                       "auth_profile": profiles.get(src),
+                       "identities": ids}
+                      for src, ids in sorted(grouped.items())]
+            return templates.TemplateResponse(
+                request, "partial_auth.html",
+                {"groups": groups, "queue": queue, "events": events,
+                 "stations": stations, "station_sources": station_sources,
+                 "egresses": egresses, "auth_alert": auth_alert,
+                 "summary": {
+                     "total": len(pool),
+                     "active": sum(1 for r in pool if r["status"] == "active"),
+                     "login_required": len(queue),
+                     "leased": sum(1 for r in pool if r["leased"])}})
+        except Exception as e:  # noqa: BLE001
+            return _unavailable(e)
+
+    # ── login-station console (login-station-console 3.2/3.3) ──────────────
+    # One-click login: the matrix's login_required rows post here; the HTMX
+    # response swaps the observation view (an iframe on the reverse-proxied
+    # noVNC page) into #station-view and refreshes the polled partial. The
+    # observation channel itself never bypasses the panel gate above.
+    @app.post("/panel/auth/station/launch")
+    async def station_launch(request: Request):
+        """Launch a login station: ensure the identity (login_required +
+        egress), create the station Job+Service, embed the observation view."""
+        form = await request.form()
+        source = (form.get("source") or "").strip()
+        alias = (form.get("account_alias") or "").strip()
+        egress_ref = (form.get("egress_ref") or "").strip() or None
+        hx = request.headers.get("hx-request") == "true"
+        if not source or not alias:
+            if hx:
+                return _toast(HTMLResponse("", status_code=400),
+                              "源与账号别名必填 source and account_alias required",
+                              "err")
+            raise HTTPException(400, "source and account_alias are required")
+        s = _session()
+        try:
+            ensured = station_ops.ensure_identity_with_egress(
+                s, source, alias, requested_by="panel",
+                egress_ref=egress_ref)
+            if ensured.get("status") != "queued":
+                msg = _msg(request, "{}/{} 未登记：{}", "{}/{} not registered: {}",
+                           source, alias, ensured.get('reason'))
+                if hx:
+                    return _toast(HTMLResponse(""), msg, "err")
+                raise HTTPException(400, ensured.get("reason", "invalid"))
+            out = station_ops.create_station(s, source, alias,
+                                             client=_station_client())
+            _audit(request, "station_launch", target=f"{source}/{alias}",
+                   outcome="success" if out["status"] == "launched" else "failure",
+                   reason=str(out.get("reason") or out.get("station_id")))
+            if out["status"] != "launched":
+                msg = _msg(request, "{}/{} 拉起失败：{}", "{}/{} launch failed: {}",
+                           source, alias, out.get('reason'))
+                if hx:
+                    return _toast(HTMLResponse(""), msg, "err")
+                raise HTTPException(502, out.get("reason", "launch failed"))
+            stations = station_ops.station_status(s)
+            st = next(x for x in stations if x["id"] == out["station_id"])
+            egresses = station_ops.selectable_egresses(s)
+        finally:
+            s.close()
+        if not hx:
+            return RedirectResponse("/panel/auth", status_code=303)
+        resp = templates.TemplateResponse(
+            request, "_station_view.html",
+            {"st": st, "vnc_url": station_ops.station_vnc_path(out["station_id"]),
+             "egresses": egresses})
+        resp.headers["HX-Trigger"] = json.dumps({
+            "toast": {"message": _msg(
+                          request, "登录站 #{} 已拉起——请在观察窗内完成登录",
+                          "Station #{} launched — complete the login in the "
+                          "observation view", out['station_id']),
+                      "level": "ok"},
+            "auth-refresh": {}})
+        return resp
+
+    @app.post("/panel/auth/identities")
+    async def auth_identity_create(request: Request):
+        """多账号登记 (spec: Console 登录操作面): register an identity and
+        auto-assign its egress (or honour an explicit choice); the fragment
+        shows the assigned binding."""
+        form = await request.form()
+        source = (form.get("source") or "").strip()
+        alias = (form.get("account_alias") or "").strip()
+        egress_ref = (form.get("egress_ref") or "").strip() or None
+        hx = request.headers.get("hx-request") == "true"
+        if not source or not alias:
+            if hx:
+                return _toast(HTMLResponse("", status_code=400),
+                              "源与账号别名必填 source and alias required", "err")
+            raise HTTPException(400, "source and account_alias are required")
+        s = _session()
+        try:
+            out = station_ops.ensure_identity_with_egress(
+                s, source, alias, requested_by="panel",
+                egress_ref=egress_ref)
+        finally:
+            s.close()
+        _audit(request, "identity_create", target=f"{source}/{alias}",
+               outcome="success" if out.get("status") == "queued" else "failure",
+               reason=str(out.get("reason")))
+        if out.get("status") != "queued":
+            msg = _msg(request, "{}/{} 未登记：{}", "{}/{} not registered: {}",
+                       source, alias, out.get('reason'))
+            if hx:
+                return _toast(HTMLResponse(""), msg, "err")
+            raise HTTPException(400, out.get("reason", "invalid"))
+        if not hx:
+            return RedirectResponse("/panel/auth", status_code=303)
+        resp = templates.TemplateResponse(
+            request, "_identity_created.html",
+            {"out": out,
+             "proxy_masked": station_ops.mask_proxy_url(out.get("proxy_url"))})
+        resp.headers["HX-Trigger"] = json.dumps({
+            "toast": {"message": _msg(
+                          request, "{}/{} 已登记——出口 {}",
+                          "{}/{} registered — egress {}", source, alias,
+                          out.get('egress_ref') or _t(request, "未分配")),
+                      "level": "ok"},
+            "auth-refresh": {}})
+        return resp
+
+    @app.get("/panel/auth/station/{station_id}/view", response_class=HTMLResponse)
+    def station_view(request: Request, station_id: int):
+        """The observation-view fragment for a station (htmx target of the
+        board's 观察窗 button).
+
+        A station that already ended still renders here — with its failure
+        reason and a relaunch button. Returning a bare 404 for it meant the
+        operator saw 'unavailable' with no cause and no next step."""
+        s = _session()
+        try:
+            stations = station_ops.station_status(s)
+            st = next((x for x in stations if x["id"] == station_id), None)
+            egresses = station_ops.selectable_egresses(s)
+        finally:
+            s.close()
+        if st is None:
+            return HTMLResponse(_station_unavailable(station_id),
+                                status_code=404)
+        return templates.TemplateResponse(
+            request, "_station_view.html",
+            {"st": st, "vnc_url": station_ops.station_vnc_path(station_id),
+             "egresses": egresses})
+
+    @app.get("/panel/auth/station/{station_id}/status")
+    def station_status_poll(station_id: int):
+        """JSON status for the observation modal's poller: the operator sees
+        等待登录 → 已完成/失败 without reloading the frame."""
+        s = _session()
+        try:
+            st = station_ops.station_brief(s, station_id)
+        finally:
+            s.close()
+        if st is None:
+            raise HTTPException(404, "station not found")
+        return {k: st[k] for k in ("id", "source", "source_label",
+                                   "source_url", "account_alias", "status",
+                                   "live", "error")}
+
+    @app.post("/panel/auth/station/{station_id}/reclaim")
+    def station_reclaim(station_id: int, request: Request):
+        """Operator reclaim: tear the station's Job+Service down and close the
+        row (deadline backstop covers the overdue case automatically)."""
+        hx = request.headers.get("hx-request") == "true"
+        s = _session()
+        try:
+            out = station_ops.reclaim_station(s, station_id,
+                                              client=_station_client(),
+                                              actor="panel")
+            _audit(request, "station_reclaim", target=str(station_id),
+                   outcome="success" if out["status"] == "reclaimed" else "failure",
+                   reason=str(out.get("current_status") or out["status"]))
+            if out["status"] == "not_found":
+                if hx:
+                    return _toast(HTMLResponse(""),
+                                  f"station {station_id} not found", "err")
+                raise HTTPException(404, f"station {station_id} not found")
+            stations = station_ops.station_status(s)
+            st = next((x for x in stations if x["id"] == station_id), None)
+            egresses = station_ops.selectable_egresses(s)
+        finally:
+            s.close()
+        if not hx:
+            return RedirectResponse("/panel/auth", status_code=303)
+        msg = (_msg(request, "登录站 #{} 已回收", "Station #{} reclaimed", station_id)
+               if out["status"] == "reclaimed" else
+               _msg(request, "登录站 #{} 已结束（{}）；集群对象已清理",
+                    "Station #{} already {}; cluster objects cleaned", station_id,
+                    out.get('current_status')))
+        row = (templates.TemplateResponse(request, "_station_row.html",
+                                          {"t": st, "egresses": egresses})
+               if st is not None else HTMLResponse(""))
+        return _toast(row, msg)
+
+    @app.get("/panel/auth/station/{station_id}/vnc/{path:path}")
+    async def station_vnc_proxy(station_id: int, path: str, request: Request):
+        """Reverse proxy to the station's noVNC static page (and any asset
+        under it) — the only HTTP path to a station's web UI. Panel-gated
+        above; stations are never exposed directly.
+
+        The station takes tens of seconds to boot (image pull + code checkout
+        + Xvfb/websockify), during which its Service exists but refuses
+        connections. Retry briefly server-side before rendering the friendly
+        502, so the first iframe load usually lands on the real page (the
+        client-side retry stays as backstop)."""
+        import asyncio
+        import httpx
+
+        upstream = _station_upstream(station_id)
+        if upstream is None:
+            return HTMLResponse(_station_unavailable(station_id),
+                                status_code=404)
+        url = f"http://{upstream}/{path}"
+        if request.url.query:
+            url += f"?{request.url.query}"
+        up = None
+        try:
+            # trust_env=False: the station Service is cluster-internal — an
+            # ambient HTTP(S)_PROXY (dev box / egress-restricted pod) must
+            # never intercept the observation channel
+            async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(10.0, read=60.0),
+                    trust_env=False) as hc:
+                for attempt in range(STATION_PROXY_ATTEMPTS):
+                    try:
+                        up = await hc.get(
+                            url,
+                            headers={"accept":
+                                     request.headers.get("accept", "*/*")})
+                        break
+                    except httpx.HTTPError as e:
+                        if attempt == STATION_PROXY_ATTEMPTS - 1:
+                            raise
+                        logger.info("station %s boot wait (%d/%d): %s",
+                                    station_id, attempt + 1,
+                                    STATION_PROXY_ATTEMPTS, type(e).__name__)
+                        await asyncio.sleep(STATION_PROXY_RETRY_WAIT)
+        except httpx.HTTPError as e:  # noqa: BLE001 - friendly, never a 500
+            logger.warning("station %s http proxy failed: %s", station_id, e)
+            return HTMLResponse(_station_unreachable(station_id, e),
+                                status_code=502)
+        return Response(
+            content=up.content, status_code=up.status_code,
+            media_type=up.headers.get("content-type", "application/octet-stream"),
+            headers={"cache-control": "no-store"})
+
+    def _station_ws_authorized(websocket: WebSocket) -> bool:
+        """The panel gate for the websocket scope (the http middleware cannot
+        see websockets): same primitives — PANEL_TOKEN (?token= / header) or a
+        valid OIDC session cookie (with the role re-check, panel-role-gate
+        D2); an unconfigured gate stays open, exactly like the http gate."""
+        token = os.environ.get("PANEL_TOKEN")
+        if token and (websocket.query_params.get("token") == token
+                      or websocket.headers.get("x-panel-token") == token):
+            return True
+        sess = _auth.read_session(
+            websocket.cookies.get(_auth.SESSION_COOKIE))
+        if sess is not None:
+            # station VNC relay is admin-tier (design D1 route table)
+            if permission_level(sess["roles"]) >= PERM_ADMIN:
+                return True
+            allowed = _auth.allow_list()
+            if allowed is not None and sess["sub"] in allowed:
+                return True  # legacy allow-listed operator (panel-role-gate)
+        if token is None and _auth.logto_config() is None:
+            return True  # no gate configured — open panel (http parity)
+        return False
+
+    async def _relay_station_ws(websocket: WebSocket, station_id: int) -> None:
+        """Bidirectional websocket relay: browser noVNC <-> the station pod's
+        websockify. Hand-rolled two-pump relay (websockets client on the
+        upstream side, starlette WebSocket on the panel side) — no extra
+        framework dependency beyond the already-vendored websockets lib."""
+        import asyncio
+
+        await websocket.accept()
+        if not _station_ws_authorized(websocket):
+            await websocket.close(code=4401, reason="panel auth required")
+            return
+        upstream = _station_upstream(station_id)
+        if upstream is None:
+            await websocket.close(code=4404, reason="station not available")
+            return
+        import websockets
+
+        try:
+            async with websockets.connect(
+                    f"ws://{upstream}/websockify",
+                    open_timeout=10,
+                    proxy=None,  # cluster-internal upstream; ignore ambient proxy env
+                ) as up:
+
+                async def _down() -> None:
+                    async for message in up:
+                        if isinstance(message, str):
+                            await websocket.send_text(message)
+                        else:
+                            await websocket.send_bytes(message)
+
+                async def _up() -> None:
+                    while True:
+                        msg = await websocket.receive()
+                        if msg["type"] == "websocket.disconnect":
+                            return
+                        if msg.get("text") is not None:
+                            await up.send(msg["text"])
+                        elif msg.get("bytes") is not None:
+                            await up.send(msg["bytes"])
+
+                done, pending = await asyncio.wait(
+                    [asyncio.create_task(_down()),
+                     asyncio.create_task(_up())],
+                    return_when=asyncio.FIRST_COMPLETED)
+                for t in pending:
+                    t.cancel()
+                for t in done:
+                    t.exception()  # surface relay errors to the event loop log
+                try:
+                    await websocket.close()
+                except Exception:  # noqa: BLE001 - peer may have closed first
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - station unreachable / dropped
+            logger.warning("station %s ws relay failed: %s", station_id, e)
+            try:
+                await websocket.close(
+                    code=1014,
+                    reason=f"station unreachable ({type(e).__name__})")
+            except Exception:  # noqa: BLE001
+                pass
+
+    @app.websocket("/panel/auth/station/{station_id}/websockify")
+    async def station_websockify(websocket: WebSocket, station_id: int):
+        """noVNC data channel (RFB-over-websocket), relayed to the station."""
+        await _relay_station_ws(websocket, station_id)
+
+    @app.websocket("/panel/auth/station/{station_id}/vnc/websockify")
+    async def station_websockify_nested(websocket: WebSocket,
+                                        station_id: int):
+        """Same relay at the vnc.html-relative path noVNC's default
+        ``path=websockify`` resolves to from the embedded page."""
+        await _relay_station_ws(websocket, station_id)
+
+    # ── indicator observatory (panel-indicator-observatory) ──────────────────
+    # Same-session reads of the same tables the MCP tools serve (registry +
+    # concept layer) — the board observes, never forks (spec 数据同源). All
+    # routes sit behind the gate above like every other board (spec 门禁).
+    from fd_open_data_mcp.panel import observatory as obs
+
+    RELATION_TYPES = ("exact", "close", "broader", "narrower", "related")
+
+    @app.get("/panel/indicators", response_class=HTMLResponse)
+    def indicators_home(request: Request, domain: str = "", source_db: str = "",
+                        verified: str = "", q: str = "", page: int = 1):
+        """Board home: the registry filter table (design D2/D7)."""
+        s = _session()
+        try:
+            ctx = {
+                "page_data": obs.entries_page(s, domain=domain,
+                                              source_db=source_db,
+                                              verified=verified, q=q, page=page),
+                "filters": obs.filter_options(s),
+                "domain": domain, "source_db": source_db,
+                "verified": verified, "q": q}
+            if request.headers.get("hx-request") == "true":
+                return templates.TemplateResponse(
+                    request, "partial_indicator_results.html", ctx)
+            return templates.TemplateResponse(request, "indicators.html", ctx)
+        finally:
+            s.close()
+
+    @app.get("/panel/indicators/families", response_class=HTMLResponse)
+    def indicator_families(request: Request):
+        s = _session()
+        try:
+            return templates.TemplateResponse(
+                request, "indicator_families.html",
+                {"families": obs.families_overview(s)})
+        finally:
+            s.close()
+
+    @app.get("/panel/indicators/families/{code}", response_class=HTMLResponse)
+    def indicator_family(request: Request, code: str):
+        s = _session()
+        try:
+            fam = obs.family_detail(s, code)
+            if fam is None:
+                raise HTTPException(404, f"family {code} not found")
+            return templates.TemplateResponse(
+                request, "indicator_family.html", {"fam": fam})
+        finally:
+            s.close()
+
+    @app.get("/panel/indicators/concepts/{concept_id}",
+             response_class=HTMLResponse)
+    def indicator_detail(request: Request, concept_id: int):
+        s = _session()
+        try:
+            d = obs.concept_detail(s, concept_id)
+            if d is None:
+                raise HTTPException(404, f"concept {concept_id} not found")
+            return templates.TemplateResponse(
+                request, "indicator_detail.html", {"d": d})
+        finally:
+            s.close()
+
+    @app.get("/panel/indicators/relations", response_class=HTMLResponse)
+    def indicator_relations(request: Request, vocabulary: str = "",
+                            relation: str = "", source: str = "",
+                            q: str = "", page: int = 1):
+        """Relation browsing: cross-source bindings + searchable mappings."""
+        s = _session()
+        try:
+            ctx = {
+                "mappings": obs.mappings_page(s, vocabulary=vocabulary,
+                                              relation=relation, q=q, page=page),
+                "bindings": obs.bindings_page(s, source=source, q=q, page=page),
+                "vocabularies": obs.mapping_vocabularies(s),
+                "binding_sources": obs.binding_sources(s),
+                "relation_types": RELATION_TYPES,
+                "vocabulary": vocabulary, "relation": relation,
+                "source": source, "q": q}
+            if request.headers.get("hx-request") == "true":
+                return templates.TemplateResponse(
+                    request, "partial_indicator_relations.html", ctx)
+            return templates.TemplateResponse(
+                request, "indicator_relations.html", ctx)
+        finally:
+            s.close()
+
+    @app.get("/panel/indicators/coverage", response_class=HTMLResponse)
+    def indicator_coverage(request: Request):
+        """Coverage statistics: same GROUP BY registry_coverage runs, on the
+        same database — the two surfaces agree at the same moment."""
+        from fd_open_data_mcp.panel.charts import grouped_bar_geometry
+
+        s = _session()
+        try:
+            by_source = obs.coverage_by_source(s)
+            by_domain = obs.coverage_by_domain(s)
+
+            def _charts(rows, key):
+                if not rows:
+                    return None
+                labels = [str(r[key] or "—") for r in rows]
+                return {
+                    "rows": rows,
+                    "chart": grouped_bar_geometry(
+                        [("registered", [r["registered"] for r in rows]),
+                         ("verified", [r["verified"] for r in rows])],
+                        labels),
+                }
+
+            return templates.TemplateResponse(
+                request, "indicator_coverage.html",
+                {"by_source": _charts(by_source, "source_db"),
+                 "by_domain": _charts(by_domain, "domain"),
+                 "present": by_source is not None})
+        finally:
+            s.close()
+
+    @app.get("/panel/indicators/graph", response_class=HTMLResponse)
+    def indicator_graph(request: Request, family: str = "",
+                        indicator: str = "", domain: str = "", depth: int = 1):
+        """Interactive relation graph page (design D1/D3). The <noscript>
+        fallback carries a server-rendered relation listing — no empty or
+        broken page without client scripting (spec panel-ui 降级)."""
+        s = _session()
+        try:
+            try:
+                iid = int(indicator) if indicator else None
+            except ValueError:
+                iid = None
+            depth = min(max(1, depth), obs.GRAPH_MAX_DEPTH)
+            fams = obs.families_overview(s)
+            latest = obs.mappings_page(s, page=1).get("rows", [])
+            ctx = {
+                "family": family, "indicator": iid if iid is not None else "",
+                "domain": domain, "depth": depth,
+                "families": fams[:30],
+                "fallback_family": next(
+                    (f for f in fams if f["n_members"]), None),
+                "fallback_mappings": latest[:obs.RELATIONS_PAGE_SIZE],
+                "registry_filters": obs.filter_options(s)}
+            return templates.TemplateResponse(
+                request, "indicator_graph.html", ctx)
+        finally:
+            s.close()
+
+    @app.get("/panel/indicators/graph.json")
+    def indicator_graph_json(family: str = "", indicator: str = "",
+                             domain: str = "", depth: int = 1):
+        """Bounded neighborhood JSON for the relation graph (design D3):
+        one of family/indicator/domain selects the view; depth and node
+        count are clamped server-side."""
+        try:
+            iid = int(indicator) if indicator else None
+        except ValueError:
+            iid = None
+        s = _session()
+        try:
+            data = obs.graph_neighborhood(
+                s, family=family or None, indicator=iid,
+                domain=domain or None, depth=depth)
+        finally:
+            s.close()
+        if data is None:
+            return {"nodes": [], "edges": [], "truncated": False,
+                    "error": "unknown family/indicator/domain"}
+        return data
+
+    # ── scope management (panel-indicator-observatory 3.1; wave 2 — depends
+    # on registry-transparent-read-and-scope, now landed as scoping.py).
+    # Same-process direct calls to the indicator-scope service functions —
+    # the exact functions the MCP scope tools call (design D5) — so a scope
+    # created here is immediately usable via the tools, by construction.
+    from fd_open_data_mcp import scoping as _scoping
+
+    SCOPE_DIMENSIONS = ("source_dbs", "domains", "semantic_codes",
+                        "native_codes")
+
+    def _scope_rules_from_form(form) -> dict:
+        """Four comma-separated inputs -> the rules dict normalize_rules
+        consumes (empty strings become empty lists = no constraint)."""
+        return {dim: [v.strip() for v in (form.get(dim) or "").split(",")
+                      if v.strip()]
+                for dim in SCOPE_DIMENSIONS}
+
+    def _scopes_redirect(msg: str = "", err: str = "") -> RedirectResponse:
+        from urllib.parse import quote
+        q = f"?msg={quote(msg)}" if msg else (f"?err={quote(err)}" if err else "")
+        return RedirectResponse(f"/panel/indicators/scopes{q}", status_code=303)
+
+    @app.get("/panel/indicators/scopes", response_class=HTMLResponse)
+    def scope_list_page(request: Request, msg: str = "", err: str = ""):
+        s = _session()
+        try:
+            scopes = []
+            for sc in _scoping.scope_list(s):
+                try:
+                    stats = _scoping.scope_stats(s, sc["name"], days=7)
+                    totals = {"calls": stats["total_calls"],
+                              "results": stats["total_results_returned"]}
+                except Exception:  # noqa: BLE001 - stats must never sink the list
+                    totals = {"calls": 0, "results": 0}
+                scopes.append({**sc, "week_totals": totals})
+            return templates.TemplateResponse(
+                request, "indicator_scopes.html",
+                {"scopes": scopes, "msg": msg, "err": err,
+                 "dimensions": SCOPE_DIMENSIONS})
+        finally:
+            s.close()
+
+    @app.post("/panel/indicators/scopes/create")
+    async def scope_create_page(request: Request):
+        form = await request.form()
+        name = (form.get("name") or "").strip()
+        rules = _scope_rules_from_form(form)
+        s = _session()
+        try:
+            out = _scoping.scope_create(
+                s, name, rules, description=form.get("description") or None)
+        except ValueError as e:  # empty scope / reserved / duplicate
+            _audit(request, "scope_create", target=name,
+                   outcome="failure", reason=str(e))
+            return _scopes_redirect(err=str(e))
+        finally:
+            s.close()
+        _audit(request, "scope_create", target=name, outcome="success",
+               reason=f"matched={out.get('matched')}")
+        return _scopes_redirect(
+            msg=f"scope {out['name']} 已创建 created — 匹配 matched "
+                f"{out.get('matched')} 指标 indicators，立即可供 MCP scope "
+                f"工具使用 immediately usable via the MCP scope tools")
+
+    @app.get("/panel/indicators/scopes/{scope_name}",
+             response_class=HTMLResponse)
+    def scope_detail_page(request: Request, scope_name: str, err: str = ""):
+        s = _session()
+        try:
+            scopes = {sc["name"]: sc for sc in _scoping.scope_list(s)}
+            sc = scopes.get(scope_name)
+            if sc is None:
+                raise HTTPException(404, f"scope {scope_name} not found")
+            try:
+                stats = _scoping.scope_stats(s, scope_name, days=30)
+            except _scoping.ScopeNotFound:
+                stats = {"days": [], "total_calls": 0,
+                         "total_results_returned": 0}
+            return templates.TemplateResponse(
+                request, "indicator_scope_detail.html",
+                {"sc": sc, "stats": stats, "err": err,
+                 "dimensions": SCOPE_DIMENSIONS})
+        finally:
+            s.close()
+
+    @app.post("/panel/indicators/scopes/{scope_name}/update")
+    async def scope_update_page(scope_name: str, request: Request):
+        form = await request.form()
+        rules = _scope_rules_from_form(form)
+        from urllib.parse import quote
+
+        s = _session()
+        try:
+            _scoping.scope_update(
+                s, scope_name, rules, description=form.get("description") or None)
+        except ValueError as e:
+            _audit(request, "scope_update", target=scope_name,
+                   outcome="failure", reason=str(e))
+            return RedirectResponse(
+                f"/panel/indicators/scopes/{scope_name}?err={quote(str(e))}",
+                status_code=303)
+        except _scoping.ScopeNotFound as e:
+            raise HTTPException(404, str(e)) from e
+        finally:
+            s.close()
+        _audit(request, "scope_update", target=scope_name, outcome="success")
+        return RedirectResponse(
+            f"/panel/indicators/scopes/{scope_name}?msg="
+            + quote("scope 规则已更新 rules updated"), status_code=303)
+
+    @app.post("/panel/indicators/scopes/{scope_name}/delete")
+    def scope_delete_page(scope_name: str, request: Request):
+        s = _session()
+        try:
+            _scoping.scope_delete(s, scope_name)
+        except _scoping.ScopeNotFound as e:
+            raise HTTPException(404, str(e))
+        finally:
+            s.close()
+        _audit(request, "scope_delete", target=scope_name, outcome="success")
+        return _scopes_redirect(msg=f"scope {scope_name} 已删除 deleted")
+
+    # ── editor ─────────────────────────────────────────────────────────────
+    def _editor_context(s, policy: CrawlPolicy | None):
+        selected = set(policy.concept_ids) if policy else set()
+        return {
+            "policy": policy.toDict() if policy else None,
+            "concept_groups": _concept_groups(s),
+            "selected": selected,
+            "entity_types": _entity_types(s),
+            "frequencies": FREQUENCIES, "modes": MODES,
+            "date_policy_modes": DATE_POLICY_MODES,
+            "default_cron": "0 6 * * *",
+        }
+
+    @app.get("/panel/policies/new", response_class=HTMLResponse)
+    def policy_new(request: Request, msg: str = "", err: str = ""):
+        s = _session()
+        try:
+            ctx = _editor_context(s, None)
+            ctx.update(msg=msg, err=err)
+            return templates.TemplateResponse(request, "policy_edit.html", ctx)
+        finally:
+            s.close()
+
+    @app.get("/panel/policies/template", response_class=HTMLResponse)
+    def policy_template(request: Request, frequency: str = "daily"):
+        """Frequency-driven policy template (panel-ops-console, design D7):
+        pre-selects the hygiene-filtered concepts of that frequency and
+        proposes the matching cron + date policy. Input aid only — the saved
+        artifact is an ordinary policy row."""
+        s = _session()
+        try:
+            concepts = _template_concepts(s, frequency)
+            pseudo = {
+                "frequency": frequency, "mode": "per_date", "enabled": True,
+                "cron_expr": _TEMPLATE_CRON.get(frequency, "0 6 * * *"),
+                "date_policy": ({"mode": "trailing", "days": 1}
+                                if frequency == "daily" else {"mode": "since_last"}),
+            }
+            ctx = _editor_context(s, None)
+            ctx.update(policy=pseudo, is_template=True,
+                       template_frequency=frequency,
+                       selected={c.id for c in concepts})
+            return templates.TemplateResponse(request, "policy_edit.html", ctx)
+        finally:
+            s.close()
+
+    @app.get("/panel/policies/{policy_id}", response_class=HTMLResponse)
+    def policy_edit(request: Request, policy_id: int):
+        s = _session()
+        try:
+            p = _policy_or_404(s, policy_id)
+            return templates.TemplateResponse(request, "policy_edit.html", _editor_context(s, p))
+        finally:
+            s.close()
+
+    @app.post("/panel/policies/save")
+    async def policy_save(request: Request):
+        form = await request.form()
+        payload = _policy_from_form(form)
+        if not payload["name"] or not payload["concept_ids"]:
+            raise HTTPException(400, "name and at least one concept are required")
+        s = _session()
+        try:
+            pid = form.get("policy_id")
+            if pid:
+                p = _policy_or_404(s, int(pid))
+                for k, v in payload.items():
+                    setattr(p, k, v)
+            else:
+                s.add(CrawlPolicy(**payload))
+            s.commit()
+        finally:
+            s.close()
+        _audit(request, "policy_save", target=str(payload["name"]),
+               outcome="success",
+               reason=f"policy_id={form.get('policy_id') or 'new'}")
+        return RedirectResponse("/panel/policies", status_code=303)
+
+    def _policy_row_response(request: Request, s, pid: int):
+        p = s.query(CrawlPolicy).get(pid)
+        if p is None:
+            return None
+        return templates.TemplateResponse(
+            request, "_policy_row.html", {"p": p.toDict()})
+
+    @app.post("/panel/policies/{policy_id}/toggle")
+    def policy_toggle(policy_id: int, request: Request):
+        s = _session()
+        try:
+            p = _policy_or_404(s, policy_id)
+            p.enabled = not p.enabled
+            s.commit()
+            _audit(request, "policy_toggle", target=str(policy_id),
+                   outcome="success",
+                   reason=f"enabled={p.enabled} name={p.name}")
+            if request.headers.get("hx-request") == "true":
+                state = _t(request, "已启用" if p.enabled else "已停用")
+                return _toast(_policy_row_response(request, s, policy_id),
+                              f"{p.name} {state}")
+        finally:
+            s.close()
+        return RedirectResponse("/panel/policies", status_code=303)
+
+    @app.post("/panel/policies/{policy_id}/delete")
+    def policy_delete(policy_id: int, request: Request):
+        s = _session()
+        try:
+            p = _policy_or_404(s, policy_id)
+            s.delete(p)
+            s.commit()
+            _audit(request, "policy_delete", target=str(policy_id),
+                   outcome="success", reason=f"name={p.name}")
+            if request.headers.get("hx-request") == "true":
+                # empty 200 body removes the swapped row
+                return _toast(HTMLResponse(""), _msg(request, "{} 已删除", "{} deleted", p.name))
+        finally:
+            s.close()
+        return RedirectResponse("/panel/policies", status_code=303)
+
+    @app.post("/panel/policies/{policy_id}/run-now")
+    def policy_run_now(policy_id: int, request: Request):
+        from fd_open_data_mcp.refresh.reconciler import _default_launcher, launch_policy
+
+        hx = request.headers.get("hx-request") == "true"
+        s = _session()
+        try:
+            p = _policy_or_404(s, policy_id)
+            result = launch_policy(s, p, _default_launcher())
+            _audit(request, "policy_run_now", target=str(policy_id),
+                   outcome="success" if result.get("status") == "launched" else "failure",
+                   reason=str(result.get("reason") or result.get("run_id")))
+            if hx:
+                if result.get("status") == "launched":
+                    return _toast(_policy_row_response(request, s, policy_id),
+                                  _msg(request, "{} 已触发运行（run #{}）",
+                                       "{} launched (run #{})", p.name,
+                                       result.get('run_id')))
+                return _toast(_policy_row_response(request, s, policy_id),
+                              _msg(request, "{} 未触发：{}", "{} not launched: {}",
+                                   p.name, result.get('reason')), "err")
+        finally:
+            s.close()
+        return RedirectResponse(f"/panel/runs?policy_id={policy_id}", status_code=303)
+
+    # ── estimate preview (htmx partial) ────────────────────────────────────
+    def _compile_plan(s, payload: dict):
+        """Compile a payload (as produced by _policy_from_form) into a plan —
+        shared by the estimate preview and the ad-hoc launch."""
+        from fd_open_data_mcp.crawl.plan import EntityScope
+        from fd_open_data_mcp.crawl.planner import plan_crawl
+        from fd_open_data_mcp.refresh.reconciler import build_date_range
+
+        class _P:  # transient policy-like for build_date_range
+            date_policy = payload["date_policy"]
+            frequency = payload["frequency"]
+        dr, since_last = build_date_range(_P(), dt.date.today())
+        return plan_crawl(
+            s, payload["concept_ids"],
+            EntityScope(entity_type=payload["entity_type"], entity_ids=payload["entity_ids"]),
+            dr, since_last=since_last, source_filter=payload["source_filter"],
+            mode=payload["mode"])
+
+    @app.post("/panel/estimate", response_class=HTMLResponse)
+    async def estimate(request: Request):
+        payload = _policy_from_form(await request.form())
+        s = _session()
+        try:
+            from fd_open_data_mcp.refresh.reconciler import (
+                POLICY_MAX_FETCHES, estimate_fetches)
+
+            plan = _compile_plan(s, payload)
+            est = estimate_fetches(s, plan)
+            return templates.TemplateResponse(
+                request, "estimate.html", {
+                    "estimate": est, "policy_max": POLICY_MAX_FETCHES,
+                    "mode": payload["mode"],
+                    "n_concepts": len(plan.wanted_concepts),
+                    "unroutable": plan.unroutable, "unmapped": plan.unmapped})
+        except Exception as e:  # noqa: BLE001 - the preview must never 500 the editor
+            return HTMLResponse(f"<span style='color:#c0392b'>estimate failed: {e}</span>")
+        finally:
+            s.close()
+
+    # ── ad-hoc one-off crawl (panel-ops-console) ─────────────────────────────
+    @app.post("/panel/crawl/adhoc")
+    async def crawl_adhoc(request: Request):
+        """Run a plan draft once, without creating a policy (design D3)."""
+        from urllib.parse import quote
+
+        from fd_open_data_mcp.refresh.runs import launch_adhoc
+
+        payload = _policy_from_form(await request.form())
+        s = _session()
+        try:
+            plan = _compile_plan(s, payload)
+            result = launch_adhoc(s, plan, _run_launcher())
+        except Exception as e:  # noqa: BLE001 - bad form input: show, don't 500
+            _audit(request, "crawl_adhoc", target=payload.get("name"),
+                   outcome="failure", reason=str(e))
+            return RedirectResponse(f"/panel/policies/new?err={quote(str(e))}",
+                                    status_code=303)
+        finally:
+            s.close()
+        _audit(request, "crawl_adhoc", target=payload.get("name"),
+               outcome="success" if result["status"] == "launched" else "failure",
+               reason=str(result.get("reason") or result.get("run_id")))
+        if result["status"] == "launched":
+            return RedirectResponse("/panel/runs?status=running", status_code=303)
+        return RedirectResponse(
+            f"/panel/policies/new?err={quote(result['reason'])}", status_code=303)
+
+    # ── proxy operations (panel-ops-console) ─────────────────────────────────
+    @app.get("/panel/proxy", response_class=HTMLResponse)
+    def proxy_page(request: Request, msg: str = "", err: str = ""):
+        s = _session()
+        try:
+            proxies = s.query(Proxy).order_by(Proxy.provider, Proxy.id).all()
+            providers: dict[str, dict] = {}
+            for p in proxies:
+                bucket = providers.setdefault(p.provider or "(unowned)", {
+                    "name": p.provider or "(unowned)", "active": 0, "retired": 0})
+                bucket["retired" if p.status == "retired" else "active"] += 1
+            limits = s.query(SourceRateLimit).order_by(SourceRateLimit.source).all()
+            rules = (s.query(BanRule)
+                     .order_by(BanRule.source, BanRule.priority.desc()).limit(200).all())
+            return templates.TemplateResponse(request, "proxy.html", {
+                "msg": msg, "err": err,
+                "poll_seconds": POLL_SECONDS,
+                "mgmt_ready": _proxy_control_ready(),
+                "providers": sorted(providers.values(), key=lambda b: b["name"]),
+                "proxies": [
+                    {"id": p.id, "scheme": p.scheme, "ip": p.ip, "port": p.port,
+                     "auth_masked": _mask_auth(p.auth), "status": p.status,
+                     "label": p.label, "provider": p.provider or "(unowned)"}
+                    for p in proxies],
+                "rate_limits": [
+                    {"source": r.source, "max_qps": r.max_qps,
+                     "max_concurrent": r.max_concurrent,
+                     "throttled": (r.max_qps or 0) > 0}
+                    for r in limits],
+                "ban_rules": [
+                    {"source": r.source, "rule_type": r.rule_type,
+                     "pattern": r.pattern[:60], "classification": r.classification,
+                     "enabled": r.enabled}
+                    for r in rules],
+            })
+        finally:
+            s.close()
+
+    @app.get("/panel/partials/proxy", response_class=HTMLResponse)
+    def partial_proxy(request: Request):
+        """Polled circuit-health matrix: per-(source, proxy) state from the
+        shared cold table (near-realtime — hot state lives in proxy-redis)."""
+        try:
+            s = _session()
+            try:
+                rows = (s.query(SourceProxyHealth)
+                        .order_by(SourceProxyHealth.source, SourceProxyHealth.proxy_id)
+                        .limit(500).all())
+            finally:
+                s.close()
+            return templates.TemplateResponse(
+                request, "partial_proxy.html", {"circuits": [h.toDict() for h in rows]})
+        except Exception as e:  # noqa: BLE001
+            return _unavailable(e)
+
+    @app.post("/panel/proxy/import")
+    async def proxy_import(request: Request):
+        form = await request.form()
+        try:
+            out = _proxy_control("POST", "/management/proxies/import", {
+                "provider": form.get("provider") or "paid-static",
+                "text": form.get("text", ""),
+            })
+        except RuntimeError as e:
+            _audit(request, "proxy_import", outcome="failure", reason=str(e))
+            return _proxy_redirect(err=str(e))
+        _audit(request, "proxy_import", outcome="success",
+               reason=f"imported={out.get('imported', 0)} skipped={out.get('skipped', 0)}")
+        return _proxy_redirect(msg=(
+            f"imported {out.get('imported', 0)}, skipped {out.get('skipped', 0)}"
+            + (f", updated {out['updated']}" if out.get("updated") else "")))
+
+    @app.post("/panel/proxy/circuits/reset")
+    async def proxy_circuit_reset(request: Request):
+        form = await request.form()
+        try:
+            _proxy_control("POST", "/management/circuits/reset", {
+                "source": form.get("source"), "proxy_id": int(form.get("proxy_id", 0)),
+                "actor": form.get("actor") or "panel"})
+        except (RuntimeError, TypeError, ValueError) as e:
+            _audit(request, "proxy_circuit_reset", outcome="failure", reason=str(e))
+            return _proxy_redirect(err=str(e))
+        _audit(request, "proxy_circuit_reset", outcome="success",
+               target=f"{form.get('source')}/{form.get('proxy_id')}")
+        return _proxy_redirect(msg=f"circuit {form.get('source')}/{form.get('proxy_id')} -> HALF_OPEN")
+
+    @app.post("/panel/proxy/rate-limits/{source}")
+    async def proxy_rate_limit(source: str, request: Request):
+        form = await request.form()
+        raw_qps = (form.get("max_qps") or "").strip()
+        try:
+            max_qps = float(raw_qps) if raw_qps else 0.0  # blank = no throttling
+            _proxy_control("PUT", f"/management/rate-limits/{source}", {
+                "max_qps": max_qps,
+                "max_concurrent": int(form.get("max_concurrent") or 4)})
+        except (RuntimeError, TypeError, ValueError) as e:
+            _audit(request, "proxy_rate_limit", target=source,
+                   outcome="failure", reason=str(e))
+            return _proxy_redirect(err=str(e))
+        _audit(request, "proxy_rate_limit", target=source, outcome="success",
+               reason=f"max_qps={max_qps}")
+        return _proxy_redirect(msg=f"rate limit for {source} saved")
+
+    # NOTE: the dynamic {proxy_id} route goes LAST so the literal paths above
+    # are never shadowed by a partial int-converter match.
+    @app.post("/panel/proxy/{proxy_id}/status")
+    async def proxy_set_status(proxy_id: int, request: Request):
+        form = await request.form()
+        try:
+            out = _proxy_control("POST", f"/management/proxies/{proxy_id}/status", {
+                "status": form.get("status"), "actor": form.get("actor") or "panel"})
+        except RuntimeError as e:
+            _audit(request, "proxy_status", target=str(proxy_id),
+                   outcome="failure", reason=str(e))
+            return _proxy_redirect(err=str(e))
+        if out.get("status") == "not_found":
+            _audit(request, "proxy_status", target=str(proxy_id),
+                   outcome="failure", reason="not_found")
+            return _proxy_redirect(err=f"proxy {proxy_id} not found")
+        _audit(request, "proxy_status", target=str(proxy_id), outcome="success",
+               reason=str(out.get("proxy_status")))
+        return _proxy_redirect(msg=f"proxy {proxy_id} -> {out.get('proxy_status')}")
+
+    return app
+
+
+app = create_app()

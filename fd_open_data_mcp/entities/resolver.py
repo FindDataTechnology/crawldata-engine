@@ -1,0 +1,442 @@
+"""Cross-source entity identifier resolution + applicability guard.
+
+- ``check_applicability`` rejects a request whose entity_type doesn't match
+  the concept's entity_type (spec entity-identity).
+- ``resolve_identifier`` returns the per-source identifier for an entity, or
+  None - callers skip that source on None (graceful degradation, design.md).
+- ``find_entity_by_identifier`` resolves the other way: an external anchor
+  (Wikidata QID, Data Commons DCID) back to the local entity carrying it.
+- ``seed_*`` populate entity_source_identifiers for the common mappings.
+"""
+from __future__ import annotations
+
+import logging
+import re
+from typing import Optional
+
+from sqlalchemy.orm import Session
+
+from fd_open_data_mcp.models import Concept, Entity, EntitySourceIdentifier
+
+logger = logging.getLogger(__name__)
+
+# Anchor sources: identifiers that point at an entity in an external graph.
+ANCHOR_SOURCES: tuple[str, ...] = ("wikidata", "datacommons")
+_QID = re.compile(r"^Q\d+$")
+
+
+class InvalidIdentifier(ValueError):
+    """Raised when an identifier does not match the expected form for its source."""
+
+
+class EntityTypeMismatch(Exception):
+    """Raised when a concept is requested for an incompatible entity type."""
+
+
+class ConceptDeprecated(Exception):
+    """Raised when a deprecated concept is requested for dispatch.
+
+    Carries the canonical replacement (if any) so callers can surface it to the
+    user (spec ``concept-canonicalization``).
+    """
+
+    def __init__(self, concept, replacement=None):
+        self.concept = concept
+        self.replacement = replacement
+        msg = f"concept {concept.code} (id={concept.id}) is deprecated"
+        if replacement is not None:
+            msg += f"; use canonical replacement {replacement.code} (id={replacement.id})"
+        super().__init__(msg)
+
+
+def find_canonical_replacement(session: Session, concept: Concept):
+    """Find the non-deprecated canonical concept for a deprecated one (by name_zh).
+
+    SAME entity_type wins: a deprecated ``price.open`` (stock) must not be
+    aliased to a crypto/index twin that merely shares the Chinese name. The
+    symbol -> entity-typed migration keeps its fallback (a ``symbol``-typed
+    deprecated concept may resolve to its non-symbol name-mate). Cross-domain
+    suggestions (stock -> crypto) are never returned.
+    """
+    if not concept.name_zh:
+        return None
+    candidates = (
+        session.query(Concept)
+        .filter(
+            Concept.name_zh == concept.name_zh,
+            Concept.deprecated.is_(False),
+            Concept.id != concept.id,
+        )
+        .all()
+    )
+    if not candidates:
+        return None
+    same_type = [c for c in candidates if c.entity_type == concept.entity_type]
+    if same_type:
+        return same_type[0]
+    if concept.entity_type == "symbol":
+        non_symbol = [c for c in candidates if c.entity_type != "symbol"]
+        if non_symbol:
+            return non_symbol[0]
+    return None
+
+
+def check_applicability(session: Session, concept_id: int, entity_type: str) -> Concept:
+    """Return the concept if it applies to entity_type; raise on mismatch or deprecation."""
+    c = session.get(Concept, concept_id)
+    if c is None:
+        raise ValueError(f"concept {concept_id} not found")
+    if c.deprecated:
+        raise ConceptDeprecated(c, find_canonical_replacement(session, c))
+    if c.entity_type != entity_type:
+        raise EntityTypeMismatch(
+            f"concept {c.code} applies to entity_type={c.entity_type}, not {entity_type}"
+        )
+    return c
+
+
+def resolve_identifier(
+    session: Session, entity_type: str, entity_id: int, source: str,
+) -> Optional[str]:
+    """Return the per-source identifier for an entity, or None if none registered."""
+    row = session.query(EntitySourceIdentifier).filter_by(
+        entity_type=entity_type, entity_id=entity_id, source=source,
+    ).first()
+    return row.identifier if row else None
+
+
+def normalize_identifier(source: str, identifier: str) -> str:
+    """Validate + normalize a per-source identifier.
+
+    Anchor sources have a declared form: a Wikidata anchor is a QID matching
+    ``Q<digits>`` (case-insensitive on input, stored upper-cased), a Data
+    Commons anchor is a non-empty DCID such as ``country/CHN``. Other sources
+    are passed through unchanged.
+    """
+    ident = (identifier or "").strip()
+    if source == "wikidata":
+        ident = ident.upper()
+        if not _QID.match(ident):
+            raise InvalidIdentifier(
+                f"invalid wikidata identifier '{identifier}': expected a QID "
+                f"matching Q<digits> (e.g. Q148)"
+            )
+    elif source == "datacommons" and not ident:
+        raise InvalidIdentifier("datacommons identifier must be a non-empty DCID")
+    return ident
+
+
+def add_identifier(
+    session: Session, entity_type: str, entity_id: int, source: str, identifier: str,
+) -> EntitySourceIdentifier:
+    """Upsert a per-source entity identifier (validated against its source's form)."""
+    identifier = normalize_identifier(source, identifier)
+    row = session.query(EntitySourceIdentifier).filter_by(
+        entity_type=entity_type, entity_id=entity_id, source=source,
+    ).first()
+    if row:
+        row.identifier = identifier
+    else:
+        row = EntitySourceIdentifier(
+            entity_type=entity_type, entity_id=entity_id, source=source, identifier=identifier,
+        )
+        session.add(row)
+        session.flush()
+    session.commit()
+    return row
+
+
+def entity_anchors(session: Session, entity_type: str, entity_id: int) -> list[dict]:
+    """External anchors (source + identifier) carried by one entity."""
+    rows = (
+        session.query(EntitySourceIdentifier)
+        .filter_by(entity_type=entity_type, entity_id=entity_id)
+        .order_by(EntitySourceIdentifier.source)
+        .all()
+    )
+    return [{"source": r.source, "identifier": r.identifier} for r in rows]
+
+
+def anchors_by_entity(
+    session: Session, entity_type: str, entity_ids: list[int],
+) -> dict[int, list[dict]]:
+    """Anchors for many entities of one type, keyed by ``entity_id``."""
+    out: dict[int, list[dict]] = {}
+    if not entity_ids:
+        return out
+    rows = (
+        session.query(EntitySourceIdentifier)
+        .filter(
+            EntitySourceIdentifier.entity_type == entity_type,
+            EntitySourceIdentifier.entity_id.in_(entity_ids),
+        )
+        .all()
+    )
+    for r in rows:
+        out.setdefault(r.entity_id, []).append({"source": r.source, "identifier": r.identifier})
+    return out
+
+
+def find_entity_by_identifier(session: Session, source: str, identifier: str) -> Optional[dict]:
+    """Resolve an external anchor back to the local entity carrying it.
+
+    Returns the entity's type/code/labels, or None when no entity carries the
+    identifier. An identifier that does not match the source's form is a
+    no-match, not an error (spec ``external-entity-anchors``).
+    """
+    try:
+        ident = normalize_identifier(source, identifier)
+    except InvalidIdentifier:
+        return None
+    row = session.query(EntitySourceIdentifier).filter_by(source=source, identifier=ident).first()
+    if row is None:
+        return None
+    entity = session.get(Entity, row.entity_id)
+    if entity is None:
+        return None
+    return {
+        "entity_id": entity.id,
+        "entity_type": entity.entity_type,
+        "code": entity.code,
+        "name_en": entity.name_en,
+        "name_zh": entity.name_zh,
+    }
+
+
+def persist_external_ids(
+    session: Session, entity_type: str, entity_id: int, metadata: Optional[dict],
+) -> list[dict]:
+    """Persist a manifest ``external_ids`` metadata block as anchor rows.
+
+    ``{"wikidata": "Q148", "datacommons": "country/CHN"}`` becomes two
+    ``entity_source_identifiers`` rows. Malformed or unknown entries are logged
+    and skipped — a bad anchor never fails registration (design D7).
+    """
+    anchors = (metadata or {}).get("external_ids")
+    if not isinstance(anchors, dict):
+        return []
+    persisted: list[dict] = []
+    for source, identifier in anchors.items():
+        try:
+            row = add_identifier(session, entity_type, entity_id, source, str(identifier))
+        except InvalidIdentifier as e:  # noqa: BLE001 - logged, never fatal
+            logger.warning("ignoring external_ids entry %s=%r: %s", source, identifier, e)
+            continue
+        persisted.append({"source": row.source, "identifier": row.identifier})
+    return persisted
+
+
+_ISO2_TO_ISO3: dict[str, str] = {
+    "CN": "CHN", "US": "USA", "JP": "JPN", "KR": "KOR", "DE": "DEU", "FR": "FRA",
+    "GB": "GBR", "IN": "IND", "BR": "BRA", "RU": "RUS", "CA": "CAN", "AU": "AUS",
+    "IT": "ITA", "ES": "ESP", "MX": "MEX", "ID": "IDN", "TR": "TUR", "SA": "SAU",
+    "AR": "ARG", "ZA": "ZAF", "EG": "EGY", "NG": "NGA", "NL": "NLD", "CH": "CHE",
+    "SE": "SWE", "PL": "POL", "BE": "BEL", "TH": "THA", "MY": "MYS", "SG": "SGP",
+    "PH": "PHL", "VN": "VNM", "HK": "HKG", "TW": "TWN",
+}
+
+
+def _iso2_to_iso3(code: Optional[str]) -> Optional[str]:
+    return _ISO2_TO_ISO3.get((code or "").upper())
+
+
+def _yfinance_symbol(code: str, exchange: Optional[str], market: Optional[str]) -> str:
+    """Map an A/HK/US stock code to its yfinance symbol.
+
+    A-share suffix is derived from the code prefix (spec ``stock-source-identity``):
+    ``60xxxx`` -> ``.SS`` (Shanghai), ``00xxxx``/``30xxxx`` -> ``.SZ`` (Shenzhen).
+    The exchange metadata is often the ambiguous ``"SSE/SZSE"`` with no ``market``
+    field, so the prefix is authoritative. HK is checked first because HK codes
+    (e.g. ``03988``) share leading digits with Shenzhen codes.
+    """
+    ex = (exchange or "").upper()
+    mk = (market or "").upper()
+    if "HK" in ex or mk == "HK":
+        return f"{code}.HK"
+    if code.startswith("6"):
+        return f"{code}.SS"
+    if code.startswith(("0", "3")):
+        return f"{code}.SZ"
+    return code  # US / unknown: use as-is
+
+
+def _bulk_upsert_identifiers(session: Session, rows: list[dict]) -> None:
+    """Bulk upsert identifier rows (entity_type, entity_id, source, identifier).
+
+    Uses psycopg2 ``execute_values`` for a true single-statement bulk insert when on
+    Postgres (essential for tens of thousands of rows over a remote connection);
+    falls back to per-row executemany on other dialects (e.g. SQLite in tests).
+    """
+    if not rows:
+        return
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    data = [(r["entity_type"], r["entity_id"], r["source"], r["identifier"], now) for r in rows]
+    sql = """
+        INSERT INTO entity_source_identifiers (entity_type, entity_id, source, identifier, created_at)
+        VALUES %s
+        ON CONFLICT (entity_type, entity_id, source) DO UPDATE SET identifier = EXCLUDED.identifier
+    """
+    raw = session.connection().connection  # underlying DBAPI connection
+    is_postgres = type(raw).__module__.startswith("psycopg2")
+    try:
+        if is_postgres:
+            from psycopg2.extras import execute_values
+            cur = raw.cursor()
+            try:
+                execute_values(cur, sql, data)
+            finally:
+                cur.close()
+        else:
+            # sqlite / other dialects (tests): SQLAlchemy executemany with :param placeholders.
+            # SQLite >= 3.24 supports ON CONFLICT ... DO UPDATE SET ... = EXCLUDED.<col>.
+            from sqlalchemy import text
+            session.execute(text(sql.replace("%s", "(:et, :eid, :src, :id, :ts)")),
+                            [{"et": r[0], "eid": r[1], "src": r[2], "id": r[3], "ts": r[4]} for r in data])
+    except ImportError:
+        from sqlalchemy import text
+        session.execute(text(sql.replace("%s", "(:et, :eid, :src, :id, :ts)")),
+                        [{"et": r[0], "eid": r[1], "src": r[2], "id": r[3], "ts": r[4]} for r in data])
+    session.commit()
+
+
+def seed_stock_identifiers(session: Session, db_path: Optional[str] = None) -> dict:
+    """Seed akshare (code as-is) + yfinance (code + exchange suffix) for all stock entities.
+
+    Reads the ontology ``entities`` table (entity_type='stock') so that every
+    stock - not just the taxonomy sample - gets a correct per-source identifier
+    (spec ``stock-source-identity``). The ``db_path`` arg is retained for
+    signature compatibility but unused; the session is the ontology session.
+    """
+    from fd_open_data_mcp.models import Entity
+
+    stocks = session.query(Entity).filter(Entity.entity_type == "stock").all()
+    rows: list[dict] = []
+    for st in stocks:
+        code = st.code
+        if not code:
+            continue
+        eid = st.id
+        meta = st.metadata_json or {}
+        rows.append({"entity_type": "stock", "entity_id": eid, "source": "akshare", "identifier": code})
+        yf_sym = _yfinance_symbol(code, meta.get("exchange"), meta.get("market"))
+        rows.append({"entity_type": "stock", "entity_id": eid, "source": "yfinance", "identifier": yf_sym})
+        if (meta.get("market") or "").upper() == "US":
+            rows.append({"entity_type": "stock", "entity_id": eid, "source": "edgar", "identifier": code})
+    _bulk_upsert_identifiers(session, rows)
+    return {
+        "akshare": sum(1 for r in rows if r["source"] == "akshare"),
+        "yfinance": sum(1 for r in rows if r["source"] == "yfinance"),
+        "edgar": sum(1 for r in rows if r["source"] == "edgar"),
+    }
+
+
+def seed_country_identifiers(session: Session, db_path: Optional[str] = None) -> dict:
+    """Seed per-source identifiers for all countries.
+
+    worldbank = ISO2 ``iso_code``; wbgapi = ISO3; datacommons = ``country/<ISO3>``
+    DCID (e.g. ``country/USA``), per Data Commons entity conventions.
+    """
+    from fd_open_data_mcp.entities.taxonomy import list_entities
+
+    countries = list_entities("country", db_path)
+    rows: list[dict] = []
+    for c in countries:
+        iso = c.get("iso_code")
+        if not iso:
+            continue
+        rows.append({"entity_type": "country", "entity_id": c["id"], "source": "worldbank", "identifier": iso})
+        iso3 = _iso2_to_iso3(iso)
+        if iso3:
+            rows.append({"entity_type": "country", "entity_id": c["id"], "source": "wbgapi", "identifier": iso3})
+            rows.append({"entity_type": "country", "entity_id": c["id"], "source": "datacommons", "identifier": f"country/{iso3}"})
+    _bulk_upsert_identifiers(session, rows)
+    return {
+        "worldbank": sum(1 for r in rows if r["source"] == "worldbank"),
+        "wbgapi": sum(1 for r in rows if r["source"] == "wbgapi"),
+        "datacommons": sum(1 for r in rows if r["source"] == "datacommons"),
+    }
+
+
+def repair_stock_identifiers(session: Session, apply: bool = False) -> dict:
+    """Report and optionally fix stock source-identifier drift.
+
+    A stock's canonical ``akshare`` identifier is its 6-digit ``code``;
+    ``yfinance`` is the code with the ``.SS``/``.SZ``/``.HK`` suffix
+    (spec ``stock-source-identity``). Dry-run (``apply=False``) lists every
+    drift row; ``apply=True`` re-seeds canonical ``akshare`` + ``yfinance``
+    for all stock entities via the idempotent bulk upsert.
+
+    ``cn-report`` (and any non-akshare/yfinance source) identifiers are never
+    touched - the re-seed only writes ``akshare`` and ``yfinance`` rows.
+    """
+    from fd_open_data_mcp.models import Entity
+
+    stocks = session.query(Entity).filter(Entity.entity_type == "stock").all()
+    canonical: dict[tuple[int, str], str] = {}
+    code_by_id: dict[int, str] = {}
+    for st in stocks:
+        code = st.code
+        if not code:
+            continue
+        eid = st.id
+        meta = st.metadata_json or {}
+        code_by_id[eid] = code
+        canonical[(eid, "akshare")] = code
+        canonical[(eid, "yfinance")] = _yfinance_symbol(code, meta.get("exchange"), meta.get("market"))
+
+    existing: dict[tuple[int, str], str] = {
+        (r.entity_id, r.source): r.identifier
+        for r in session.query(EntitySourceIdentifier).filter(
+            EntitySourceIdentifier.entity_type == "stock",
+            EntitySourceIdentifier.source.in_(["akshare", "yfinance"]),
+        )
+    }
+
+    drift: list[dict] = []
+    for (eid, source), canon in canonical.items():
+        stored = existing.get((eid, source))
+        if stored != canon:
+            drift.append({
+                "entity_id": eid,
+                "code": code_by_id.get(eid),
+                "source": source,
+                "stored": stored,
+                "canonical": canon,
+            })
+
+    if apply:
+        counts = seed_stock_identifiers(session)
+        return {"applied": True, "drift_found": len(drift), "reseed": counts}
+
+    return {
+        "applied": False,
+        "drift_found": len(drift),
+        "drift_total": len(drift),
+        "drift_sample": drift[:50],
+    }
+
+
+def deprecation_map(session: Session) -> dict:
+    """Return the deprecated -> canonical concept alias record.
+
+    Lists every deprecated concept and its canonical replacement (resolved by
+    name_zh via ``find_canonical_replacement``). Used by the
+    ``deprecation-map`` CLI as the authoritative alias record for callers
+    migrating off the deprecated ``symbol`` stock-concept codes.
+    """
+    deprecated = session.query(Concept).filter(Concept.deprecated.is_(True)).all()
+    rows = []
+    for c in deprecated:
+        repl = find_canonical_replacement(session, c)
+        rows.append({
+            "deprecated_id": c.id,
+            "deprecated_code": c.code,
+            "entity_type": c.entity_type,
+            "name_zh": c.name_zh,
+            "category": c.category,
+            "canonical_id": repl.id if repl else None,
+            "canonical_code": repl.code if repl else None,
+        })
+    return {"deprecated_count": len(rows), "with_replacement": sum(1 for r in rows if r["canonical_id"]), "map": rows}

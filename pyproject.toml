@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crawldata-engine"
+dynamic = ["version"]
+description = "Open-data ontology MCP: a semantic concept layer over multi-datasource financial/economic data"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "FindDataOfficial" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+]
+dependencies = [
+    "click>=8.0",
+    "sqlalchemy>=2.0,<2.1",  # 2.1 drops the psycopg2 fallback for postgresql:// (init crash 09-29)
+    "pydantic>=2.0",
+    "fastmcp>=3.4,<4",
+    "pandas>=2.0",
+    "fd-open-data-protocol>=0.3.2",
+    "pyyaml>=6.0",
+    "redis>=5.0",
+    "python-dotenv>=1.0",
+    "alembic>=1.13",
+    "networkx>=3.0",
+    "croniter>=2.0",
+    # control-plane panel (add-fund-crawl-control-center, design D7)
+    "fastapi>=0.110",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+    "uvicorn>=0.29",
+    # PostgreSQL driver for the live deployment DB (reconciler/panel/crawler)
+    "psycopg2-binary>=2.9",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "network: marks tests that call real upstream APIs (skipped by default; set RUN_NETWORK_TESTS=1 to run)",
+]
+
+[project.optional-dependencies]
+# Data-source stack WITHOUT browser rendering (image-slimming, 2026-10-01):
+# scrapling/playwright moved to [browser] — nothing in the crawl fleet imports
+# them; the industry line installs its own browser stack. Keep this extra
+# browser-free so the fleet image stays slim across future releases.
+data = [
+    "akshare>=1.17",
+    "yfinance>=0.2",
+    "world_bank_data>=0.1",
+    "edgartools>=2.0",
+    "wbgapi>=1.0",
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+]
+# Opt-in browser rendering (industry-line sources, browser-based scraping).
+# Install as crawldata-engine[data,browser] where a browser stack is needed.
+browser = [
+    "scrapling>=0.4.7",
+    "playwright>=1.40",
+]
+dev = ["pytest>=8.0"]
+# Semantic search (ai_search / semantic_search). fastembed runs the same
+# MiniLM weights on onnxruntime (~15MB) where torch needed ~195MB; vectors
+# stay compatible (same model, same dims — see openspec image-slimming).
+# [search-legacy] keeps the sentence-transformers/torch path for exotic
+# models fastembed does not carry.
+search = [
+    "fastembed>=0.3",
+]
+search-legacy = [
+    "sentence-transformers>=2.7",
+]
+
+[project.scripts]
+crawldata-engine = "fd_open_data_mcp.cli:cli"
+
+[tool.setuptools.dynamic]
+version = { attr = "fd_open_data_mcp.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["fd_open_data_mcp", "fd_open_data_mcp.*"]
+
+[project.urls]
+Homepage = "https://github.com/FindDataTechnology/crawldata-engine"
+Repository = "https://github.com/FindDataTechnology/crawldata-engine"
+Documentation = "https://github.com/FindDataTechnology/crawldata-engine#readme"
+Issues = "https://github.com/FindDataTechnology/crawldata-engine/issues"
+Changelog = "https://github.com/FindDataTechnology/crawldata-engine/releases"
