@@ -411,7 +411,9 @@ class SemanticObservation(Base):
     value = Column(String(255), nullable=True)
     unit = Column(String(64), nullable=True)
     source_used = Column(String(64), nullable=False)
-    fetched_at = Column(DateTime, nullable=False, default=_now)
+    # indexed by 0013_obs_month_governance (watermark/backfill scans); declared
+    # here so alembic check sees model and migration in agreement
+    fetched_at = Column(DateTime, nullable=False, default=_now, index=True)
     # Derived partition bucket 'YYYY-MM' (add-data-stream-engine task 2.2):
     # computed from date by fd_open_data_mcp.semantic.dates.obs_month_of at
     # every write site — NEVER hand-maintained. NULL = unmappable (sentinels)
